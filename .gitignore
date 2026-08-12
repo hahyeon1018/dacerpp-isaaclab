@@ -1,0 +1,45 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dacerpp_runs/
+
+# 환경변수 / 비밀정보
+.env
+*.key
+secrets.json
+
+# Python
+__pycache__/
+venv/
+*.pyc
+
+# Node.js
+node_modules/
+dist/
+
+# OS / 에디터
+.DS_Store
+.vscode/
+.idea/
+
+# ROS2 bag / 기록 데이터
+*.db3
+*.mcap
+generated/
+rosbag*/
+
+# 학습 산출물
+logs/
+outputs/
+runs/
+wandb/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/

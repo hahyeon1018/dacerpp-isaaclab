@@ -1,0 +1,77 @@
+[33mcommit fe6d7bdfc920a4829ab8bf13ccc15e7a21ba9431[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmaster[m[33m, [m[1;33mtag: [m[1;33mrun-20260721-delay[m[33m)[m
+Author: Song <hahyeon.robo@gmail.com>
+Date:   Tue Jul 21 01:42:34 2026 +0900
+
+    sim2real: 루프 지연 130ms 모델(행동 지연 1~3스텝 랜덤, IMU 전방예측 전제) + 명령 히스토리 4스텝 Markov 복원(56→62) + slip clamp 4→16
+
+[33mcommit f9117dc142533ca6f5bdacc8a2566bd1f98dd072[m[33m ([m[1;33mtag: [m[1;33mrun-20260717-52tracks-mudr[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Mon Jul 20 16:39:31 2026 +0900
+
+    tracks: 절차 25종 + 실대회장 4맵 = 52종 통합 + 지면 마찰 랜덤화 μ(0.65~1.2)
+
+[33mcommit 7564ea8af40ac1130d3f2e853930689a547dd0a5[m[33m ([m[1;33mtag: [m[1;33mrun-20260717-servo20[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Fri Jul 17 17:07:59 2026 +0900
+
+    실측: 조향 서보 20 rad/s (240fps 슬로모 확정)
+
+[33mcommit c0a6b0ba942886d3108a4ea667354243b7c9d390[m[33m ([m[1;33mtag: [m[1;33mrun-20260716-48tracks[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Fri Jul 17 16:58:41 2026 +0900
+
+    tracks: 절차 25종(복원7+신규9 고복잡·비대칭, 이분탐색 튜닝) + f1tenth 23 = 48종, 가변폭 노출 52% 회복
+
+[33mcommit f2b2cae02237eaeecbef2b6b27113f40d5310eb1[m[33m ([m[1;33mtag: [m[1;33mrun-20260716-visibility[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Fri Jul 17 07:17:24 2026 +0900
+
+    sim2real: 상대차 LiDAR 가시성 게이트(FOV/가림) + 벽마진 -0.19/pow7 + 평가 랜덤 트랙 + LiDAR 높이 0.062
+
+[33mcommit aa47c805c7ee435d70cb69a202863edadfb3ed0b[m[33m ([m[1;33mtag: [m[1;33mrun-20260716-32tracks[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Thu Jul 16 23:20:49 2026 +0900
+
+    tracks: 절차 9종 + f1tenth 23종 = 32종 통합, 공통 ds=0.15 등호장 리샘플(인덱스 거리 통일) + 정점 평활
+
+[33mcommit a5867a16a48b127fc8bc94982dd87334d6ff72d0[m[33m ([m[1;33mtag: [m[1;33mrun-20260714-yawobs[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Tue Jul 14 17:09:56 2026 +0900
+
+    obs: 요레이트+횡속도 추가(54→56) + PWM 조향 대응(스무딩 분리/크기 벌점/k_slip 커리큘럼)
+
+[33mcommit 21d806027e756118664afded9c172d414157723c[m[33m ([m[1;33mtag: [m[1;33mrun-20260712-antidrift[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Sun Jul 12 06:38:16 2026 +0900
+
+    reward: 드리프트 억제(k_slip 0.3/데드존 12°) + 좁은폭 돌진 억제(k_term_speed 0.45, k_wall 0.45, pow_eta 1.2)
+
+[33mcommit 0d8f38a1c757f264ee480708371af0a87563b6ae[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Fri Jul 10 19:51:08 2026 +0900
+
+    test_lidar: --car 플래그(기본 b=배포 대상) + A 평가 시 캡 해제 + 속도 로깅
+
+[33mcommit a3e873f80377074e0ddb5d6b0762e2a9f4372b51[m[33m ([m[1;33mtag: [m[1;33mrun-20260710_1-antispin[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Fri Jul 10 19:37:32 2026 +0900
+
+    reward: 사이드슬립 데드존 벌점 + 스핀(herr>100°) 조기종료 + Car A 랜덤 속도캡(추월 연습)
+
+[33mcommit de806689ca8b1511845ae2d778fc4984597ac512[m[33m ([m[1;33mtag: [m[1;33mrun-20260710-analytic-tire[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Fri Jul 10 00:27:37 2026 +0900
+
+    physics: 해석 타이어 힘 모델 전환 (접촉 횡그립 붕괴 해결) + 진단 스크립트
+
+[33mcommit d8b3167fe7938285ed5a687b8a0eb513a318e45f[m[33m ([m[1;33mtag: [m[1;33mrun-20260709-collapse-fix[m[33m)[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Thu Jul 9 18:47:50 2026 +0900
+
+    fix: alpha 퇴행평형 차단 + lookahead 13.6m + 속도의존 종말벌점/벽 shaping + 속도 커리큘럼 + 붕괴 감지 로깅
+
+[33mcommit df12baf279d6bec6167ae28c250b2b1e9a3b900c[m
+Author: hse09021 <hse09021@naver.com>
+Date:   Thu Jul 9 18:11:25 2026 +0900
+
+    initial: accel deadzone 3.5, r_collision -5, v_min 1.0

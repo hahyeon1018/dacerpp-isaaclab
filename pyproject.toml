@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dacerpp_isaaclab"
+version = "0.1.0"
+description = "DACER++ (risk-sensitive diffusion actor-critic) for Isaac Lab multi-track racing"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "trimesh",
+    "scikit-learn",   # entropy.py GMM
+    # torch / isaaclab 는 conda env_isaaclab 에 이미 설치되어 있다고 가정
+]
+
+[tool.setuptools]
+packages = ["dacer_pp", "dacerpp_lab"]

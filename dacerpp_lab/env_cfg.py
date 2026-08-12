@@ -1,0 +1,391 @@
+"""레이싱 환경 설정."""
+from __future__ import annotations
+
+from dataclasses import MISSING
+from typing import Sequence
+
+from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sim import SimulationCfg, PhysxCfg, RigidBodyMaterialCfg
+from isaaclab.terrains import TerrainImporterCfg
+from isaaclab.utils import configclass
+
+from .track_field import TrackFieldCfg
+
+
+@configclass
+class TireModelCfg:
+    """해석적 타이어 힘 모델 (동적 자전거 모델 + 포화 슬립 곡선).
+
+    왜 접촉 타이어가 아닌가: PhysX 강체 접촉은 바퀴 회전 ω>60rad/s(차속 ~3m/s)
+    에서 접촉 솔버가 회전 바디에 매 스텝 가짜 제동 각임펄스를 만들며 횡그립이
+    μg 의 5~10%로 붕괴한다 (scripts/characterize_car.py 실측; 충돌형상/솔버
+    반복수/물리주파수/CPU·GPU 전부 교차 검증 후 배제). 실타이어 횡력은 고무
+    변형(슬립각-횡력 곡선)에서 나오므로 강체 Coulomb 접촉으로는 원리적으로
+    표현되지 않는다 — PhysX Vehicle SDK, f1tenth_gym 과 동일하게 슬립 기반
+    힘을 섀시에 직접 인가한다(수직 지지는 바퀴 접촉이 담당, 지면 마찰은 0).
+
+    ★ sim2real: 실차 (조향각, 속도) -> 요레이트/횡가속 응답을 측정해
+    mu / alpha_char / k_drive / f_drive_max 를 시스템 식별으로 맞출 것.
+    scripts/characterize_car.py 가 시뮬 쪽 응답 맵을 출력한다.
+    """
+    mu: float = 1.05               # 공칭 마찰 (mu_range=None 일 때/평가·특성측정용)
+    # 지면 마찰 도메인 랜덤화 — 대회 규정 확정 반영(2026-07-21):
+    #   "BEXCO 제2전시장 3층 Hall 5A: 경화 콘크리트 + 우레탄 코팅 마감.
+    #    일반 아스팔트 대비 마찰계수가 현저히 낮고 표면이 매끄러움"
+    # 고무-노면 건조 마찰계수 기준값: 아스팔트 0.8~1.0, 맨 콘크리트 0.7~0.9,
+    # 폴리우레탄 도막 마감 0.45~0.75(도막이 표면 요철을 메워 매끄러움).
+    # RC 소프트 컴파운드 타이어는 접지면이 작아도 컴파운드가 무르므로 상단 근처.
+    # -> U(0.55, 0.95) 로 추첨. 하한은 먼지/이형제 잔류, 상한은 청소 직후 상태.
+    # 이력: 1.2(카펫)→0.65(경화콘크리트,2026-07-21)→0.75(2026-07-22)→0.65(2026-08-07)
+    #   →2026-08-07 상향((0.45,0.85)→(0.7,1.1), 중앙 0.65→0.90): 사용자 재지시 —
+    #   실차가 코너에서 바깥벽에 붙어 과보수 주행하는 게 '그립 부족 인식'으로 인한 것이라
+    #   보고, 학습 그립을 높여 '지면에 잘 붙고 더 빠르게' 코너링(더 타이트한 라인)하도록
+    #   유도. 0.7~1.1 = 청소된 도막~카펫 상단 대역.
+    #   →2026-08-09 추가 상향((0.7,1.1)→(0.85,1.25), 중앙 0.90→1.05): 사용자 실험 지시
+    #   — 그립을 한 단계 더 올려 코너 라인을 더 타이트/고속화. 슬립 벌점 완화와 세트로 실험.
+    #   ★ 상한 1.25 는 카펫 상단 이상(고그립) 대역 — 실제 도막 그립보다 크게 높을 수 있어
+    #   sim2real 언더스티어 위험이 커진다. 실차 확인 후 밴드 재수축 필요.
+    # ★ sim2real 주의: 실제 도막 그립이 이보다 낮으면 정책이 그립을 과대평가해 오히려
+    #   실차에서 언더스티어(바깥벽 밀착)가 재발할 수 있다 — 현장 practice 스키드패드로
+    #   실측해 그 값 ±0.1 로 좁혀 재조정할 것.
+    mu_range: tuple | None = (0.85, 1.25)
+    alpha_char: float = 0.08       # 특성 슬립각(rad): F_y=-mu*N*tanh(alpha/alpha_char).
+                                   # 선형 강성 = mu*N/alpha_char (≈15N/rad/N), 포화 ~9도
+                                   # ★ 미확정 — 스키드패드 sub-limit 곡선으로 피팅
+    # ---- 실측 (2026-07-16, 코너웨이트 총 3940.6g / 앞 2161.0g 55% / 뒤 1779.6g 45%) ----
+    mass: float = 3.94             # 하중 계산용(kg) — 운동 적분은 PhysX 관성 사용
+    com_height: float = 0.07       # 무게중심 높이(m): 종방향 하중이동 (미실측, 추정 유지)
+    lf: float = 0.149              # CoM -> 앞축 거리(m) = L(0.33) x 뒤축하중비(0.4516)
+    lr: float = 0.181              # CoM -> 뒤축 거리(m) = L(0.33) x 앞축하중비(0.5484)
+    k_drive: float = 40.0          # ESC 속도서보 게인 N/(m/s): F_x = k*(v_cmd - vx)
+                                   # (VESC speed 모드 확인됨. ★ 게인/상한은 직선
+                                   #  풀스로틀 가속 로그로 피팅할 것)
+    f_drive_max: float = 22.0      # 구동/제동력 상한(모터, N) ≈ 5.6 m/s² @3.94kg
+                                   # (제동은 추가로 뒤축 마찰서클 μN_r 제한)
+    c_roll: float = 0.015          # 구름저항 계수
+    v_lat_taper: float = 0.3       # 저속 횡력 테이퍼(m/s): 정지 시 조향만으로
+                                   # 횡력이 생기는 비물리 방지 (tanh(|vx|/v))
+
+
+@configclass
+class RacingCfg:
+    """관측/행동/보상 파라미터 (업로드 racing_env.py 의 다중환경판)."""
+    # 관측
+    # 트랙 폭은 고정값이 아니라 TrackParams.width_min/width_max 의 가변 프로파일
+    # (실 대회장 덕트 간격 1~5m). 이탈판정/보상/관측 정규화는 지역 half-width 사용.
+    n_beams: int = 32
+    scan_max_range: float = 10.0
+    scan_fov: float = 2.356               # rad, 전방 ±135도
+    # 전방 곡률/폭 예견 인덱스 (인덱스당 호길이 ~0.15m -> 0.75/2.2/4.5/9/13.6m).
+    # 최원거리는 v_max(10)에서 최악 코너 한계속(~4.8m/s)까지 '데드존 준수 제동
+    # (<=3.5m/s^2)' 거리 ~11m 를 커버해야 제때 감속이 관측 가능하다.
+    # (구 최원거리 9m 는 부족 -> 감속 시점을 볼 수 없어 +90 추가. obs_dim 52->54)
+    curv_lookahead: Sequence[int] = (5, 15, 30, 60, 90)
+    # v_max 변경 시 연쇄 확인: car_cfg 의 바퀴 velocity_limit_sim(>= v_max/0.05)
+    # 과 max_linear_velocity(>= v_max+여유), 그리고 관측 정규화(speed/v_max)가
+    # 바뀌므로 재학습 필요.
+    # 12 는 랩 60m 트랙에서 제동거리(9m+)가 관측 예견을 초과해 벽 충돌 유발 -> 10.
+    # ★ 실차 v_max 미확정: VESC speed_to_erpm_gain=3550 (속도서보 모드 확인됨,
+    #   v[m/s] = erpm/3550) — 최대 ERPM 설정값 또는 직선 최고속 로그로 확정할 것.
+    v_max: float = 10.0
+    v_min: float = 1.0                    # 완전 정지 불가(최저 순항) — 브레이크체크 완화
+    # 실측(2026-07-16): 기계 한계 0.44 rad, 과열 방지를 위해 명령 상한 0.42 권장(사용자).
+    max_steering_angle: float = 0.42
+    wheel_radius: float = 0.06            # 실측 (r=6cm, 폭 4.5cm)
+    # 스캔 (벽 레이캐스트: 실제 F1TENTH 덕트 벽 대응)
+    wall_offset: float = 0.0              # 덕트 내측면이 트랙 경계보다 바깥이면 +
+    # 레이캐스트 세그먼트 윈도(중심선 인덱스 ± 개수). 트랙 축소(반경 9.33m) 후
+    # 인덱스당 호길이 ~0.15m -> ±96 ≈ ±14m 가 스캔범위(10m) 내 반대편 벽까지 커버.
+    raycast_half_window: int = 96
+    opp_radius: float = 0.28              # 상대차량 등가 반경(m) — 구 원형 footprint(지금은 det_box 사용)
+    # ---- 상대차 감지 박스 (대회 규정) ----
+    # 대회는 각 차량 뒷부분에 '감지 박스'(옆면 4면 막힌 직육면체)를 붙여 상대 LiDAR 가
+    # 검출하게 한다. 규정: "지면 10~30cm 높이 수평면에서 최소 12×12cm 공간 점유".
+    # 차 섀시(축고 6cm)는 빔 높이(~12cm) 밴드 밖이라 안 잡히고, 이 박스만 잡힌다.
+    # -> 상대차 scan footprint 를 구 원형(opp_radius) 대신 '뒷부분 12×12cm 박스'로
+    #    모델링(train/test 해석 스캔 + test_lidar 모두). 박스는 상대차 헤딩으로 정렬,
+    #    중심은 차중심에서 뒤로 det_box_rear. 높이는 2D 스캔엔 무관(시각 프림·규정 문서용).
+    det_box_size: float = 0.12            # 박스 한 변(m) — 규정 최소 12cm(작을수록 검출 난이=강건)
+    det_box_rear: float = 0.20            # 차중심→박스중심 뒤쪽 오프셋(m) — 전장 0.50 의 뒷부분
+    det_box_z: tuple = (0.10, 0.30)       # 박스 높이대(m) — 규정 10~30cm (시각 프림·문서용)
+    # ---- 장애물 (대회: 리셋마다 맵에 없던 ≤50×50cm 장애물 2~3개 회피) ----
+    # 실차 대회는 맵에 없던 소형 장애물(직육면체/삼각기둥/원기둥)을 2~3개 놓고 회피를
+    # 확인한다. 장애물은 맵/측위에 없으므로(=lat/hw/곡률 관측 불가) 차가 아는 유일한
+    # 채널은 LiDAR 뿐 — 실차 Livox 의사 스캔에 물리적으로 잡히듯, 시뮬 32빔 스캔에
+    # 2D footprint 다각형으로 오버레이한다(vectorized_track.overlay_obstacles). 별도
+    # 상태 채널을 안 써서 obs_dim 불변(58) = 실차에 장애물 감지 모듈 불필요.
+    # env 리셋(_spawn_pair)마다 재추첨 = 도메인 랜덤화. 32빔(간격 8.7°)에서 50cm
+    # 장애물은 ≤3.3m 에서 1빔 이상 확정 검출(2~8m/s 에서 0.4~1.6s 반응여유).
+    obstacles_enabled: bool = True
+    # 개수: 리셋마다 0~3개 랜덤. 대회는 2~3개지만, 없거나(0) 적은(1) 상황도 학습해야
+    # 유무·개수에 강건해진다. 균등(각 25%)이 아니라 아래 가중치로 뽑아 3개(가장 혼잡)
+    # 확률을 낮춘다(2026-08-07). 무장애·소수 위주 + 3개는 드물게.
+    n_obstacles: tuple = (0, 3)           # 개수 범위 상/하한(가중치는 obstacle_count_weights)
+    obstacle_count_weights: tuple = (0.30, 0.30, 0.25, 0.15)  # P(0/1/2/3개), 3개=15%로 하향
+    obstacle_p: float = 1.0               # 개수 추첨 확률(1.0=항상 추첨; 0-count 는 하한 0 으로 자연 발생)
+    obstacle_max: int = 3                 # 텐서 슬롯 상한(= n_obstacles[1])
+    obstacle_size_range: tuple = (0.30, 0.50)  # 한 변/지름(m) — 30~50cm(최소 30cm, 규정 50cm 이내)
+    obstacle_shapes: tuple = ("box", "tri", "cyl")  # 직육면체/삼각기둥(2D:사각/삼각), 원기둥(팔각근사)
+    obstacle_hit_margin: float = 0.18     # 차량 등가 반경(m): footprint 까지 이 거리 이내면 충돌 종료
+    # 장애물-벽 통과 간격 보장(m). ★대회 규정: 장애물-벽 최소 50cm 통과 공간 보장.
+    # pass_clear 는 '배치 지점 국소 법선' 기준 하한이라, 곡선부에선 실제 최근접-벽
+    # 간격이 그보다 ~4cm 작을 수 있다(실측: 0.50 설정 시 최소 0.46). 규정 50cm 를
+    # '진짜' 보장하려면 그 slack(~0.05~0.07) 만큼 여유를 둬야 하므로 0.57 로 잡는다
+    # (실측 벽간격 최소 ~0.52m = 규정 50cm 위 2cm 여유). 통과 가능성도 충족: 필요 간격
+    # = hit_margin(0.18)+이탈버퍼(0.20)=0.38 < 0.57, 주행 레인 0.57-0.38=0.19m 확보.
+    # 차폭 0.30(윤거0.255+타이어0.045)의 1.9배.
+    # ★2026-08-09 '한쪽 벽만 보장'으로 변경: 예전엔 양쪽 벽 모두 이 간격을 보장해
+    #   장애물이 항상 중앙 대역에만 놓였다. 이제는 최소 한쪽 벽에만 pass_clear(통과
+    #   레인)를 보장하고, 반대쪽 벽에는 obstacle_wall_min_clear 만 있으면 벽에 붙여
+    #   배치할 수 있다(실차처럼 한쪽 벽에 기댄 장애물 허용, 좁은 구간에도 배치 가능).
+    obstacle_pass_clear: float = 0.57     # 배치 시 '최소 한쪽' 벽에 이만큼(m) 통과 간격 보장(규정 50cm 여유)
+    # 위 '한쪽 보장'에서 반대(장애물이 기대는) 벽 쪽 최소 여유(m). 장애물이 벽을 뚫거나
+    # 딱 붙지 않게 하는 버퍼 — 곡선부 국소법선 slack(~4cm)을 덮어 실제로도 벽 안쪽에
+    # 머물게 한다. 이쪽은 통과 레인이 아니므로(차는 반대쪽으로 통과) 작게 둔다.
+    obstacle_wall_min_clear: float = 0.10
+    obstacle_spawn_clear_s: float = 2.5   # 스폰 지점에서 이 호길이(m) 이내엔 장애물 안 둠(차↔장애물 겹침 방지)
+    obstacle_min_sep: float = 1.2         # 장애물 중심 간 최소 거리(m) — 서로 겹치거나 붙어 배치 방지
+    obstacle_grace_steps: int = 5         # 스폰 직후 이 스텝 동안 장애물 충돌 면제(리스폰 즉시충돌 루프 방지)
+    # 관측 도메인 랜덤화 (sim2real; 평가 시 obs_noise=False 로 끌 것)
+    obs_noise: bool = True
+    # ---- 스캔 노이즈: 실측 Livox 수준으로 현실화 (2026-07-31 조향 진동 진단) ----
+    # 진단 결과 sim(해석/RayCaster) 스캔은 매우 매끄러워(갭 중앙 2mm) 조향 진동을
+    # 못 만들지만, 실차 Livox 는 훨씬 노이지(분석 [1]: MAE 0.02~0.29m)라 결정론적
+    # 정책이 그 노이즈를 조향으로 직결해 진동한다. 후처리 조향 EMA 는 무효(분석 [6]).
+    # -> 학습 스캔에 (a)큰 백색노이즈 (b)각도 지터(섹터 축약의 각 불확실성) (c)희소
+    # 스파이크(큰 빔오차 꼬리)를 넣어 정책이 스캔을 저역통과하고 안정적 lat/hw/곡률로
+    # 조향하도록 학습 -> 실차 노이즈에 강건. (장애물은 빔을 1~3m 단축하므로 이 노이즈로
+    # 가려지지 않음 = 회피 학습과 양립.)
+    scan_noise_std: float = 0.035         # 빔 거리 백색 가우시안(m) — 0.02 에서 상향
+    scan_angle_jitter: float = 0.009      # 빔 각도 지터(rad, ±0.5°) — Livox/섹터축약 각 불확실성
+    scan_spike_p: float = 0.05            # 빔별 큰 오차(스파이크) 확률 — 실측 MAE 꼬리 재현
+    scan_spike_std: float = 0.13          # 스파이크 크기(m)
+    scan_dropout_p: float = 0.03          # 빔 무반사(=max_range) 확률
+    pose_noise_lateral: float = 0.03      # 측위 횡오차 노이즈(m) — 관측에만 적용
+    pose_noise_heading: float = 0.02      # 측위 heading 노이즈(rad)
+    gyro_noise_std: float = 0.05          # 요레이트 관측 노이즈(rad/s) — 실차 IMU 자이로
+    vy_noise_std: float = 0.05            # 횡속도 관측 노이즈(m/s) — 실차 추정치 오차
+    opp_pos_noise: float = 0.05           # 상대차량 위치 추정 노이즈(m)
+    opp_dropout_p: float = 0.05           # 상대차량 검출 실패 확률(특징 5개 전부 0)
+    # 보상
+    k_progress: float = 1.0
+    # 중심 정렬 벌점: 크면 레이싱 라인(폭 활용)을 벌점하므로 약하게만.
+    # 벽 '경계' 안전은 k_wall shaping + 속도 의존 종말 벌점이 담당한다.
+    k_deviation: float = 0.01
+    # 벽 근접 shaping: k_wall * (|lat| / 종료경계)^wall_pow.
+    # 구 설계는 신호가 종말 -5 단일 이벤트에 100% 집중되어 이탈 1스텝 전에도
+    # 최대보상의 96%를 지급(경고 그래디언트 전무)했다. 고차 램프라 중앙부
+    # (비율 0.6 -> 0.45*0.6^8 ~= 0.008)에선 무시 가능, 경계 직전엔 진행보상을
+    # 넘어서(0.45) 레이싱 라인은 침해하지 않으면서 회피 신호를 만든다.
+    # (0.3 -> 0.45: 좁은 구간(반폭 0.77m)에서 A 옆을 파고들다 벽에 스치는
+    # 사고 11건 계측 -> 벽 마진 잠식 자체의 비용 강화, 2026-07-12)
+    k_wall: float = 0.45
+    # wall_pow 8 -> 7 (2026-07-16): 벽 근접 램프를 약간 넓혀 경계 접근 자체가
+    # 조금 더 일찍 과세되게 (비율 0.8 지점: 0.075 -> 0.094/step). offtrack_margin
+    # 강화(-0.19)와 함께 '실환경 벽 스침 위험' 대응 — 둘 다 소폭만.
+    wall_pow: float = 7.0
+    # 행동 스무딩(조향/스로틀 분리) + 조향 크기 벌점 (2026-07-14, PWM 조향 대응):
+    # 웜스타트 5.05M(20260714)에서 정책이 조향을 ±풀락 구형파(초당 4.4회 반전,
+    # 조향 std 0.94)로 변조하는 'PWM 모드'로 수렴 — 요레이트 진동이 그립의 72%를
+    # 태워 속도가 μg/|r|≈6.1 에 캡. 공용 k_smooth=0.02 로는 PWM 비용이 스텝당
+    # ~0.012 로 사실상 무료였다. 조향 델타만 0.08 로 올려 PWM 을 직접 과세하고,
+    # 조향 크기 벌점(0.01·steer²)으로 포화(|steer|=1, 전 런 공통 93~97%) 습관에
+    # 상시 복귀 그래디언트를 부여한다 (필요 조향각에선 진행보상이 지배하는 크기).
+    k_smooth_steer: float = 0.08
+    k_smooth_thr: float = 0.02
+    k_steer_mag: float = 0.01
+    # 종가속도 벌점(데드존형): |a|<=deadzone 무벌점,
+    # 초과분만 k_accel*((|a|-deadzone)/(accel_ref-deadzone))^2 로 벌점.
+    # (|a|=accel_ref 그립 한계에서 벌점=k_accel.)
+    # 데드존이 없으면 "늦고 강한 제동"(빠른 코너 진입에 필수)이 과세되어
+    # 정책이 "이르고 깊은 감속->초저속 코너"로 도피한다.
+    k_accel: float = 0.05
+    accel_ref: float = 7.0
+    accel_deadzone: float = 3.5           # 가속측 데드존
+    # 감속측 데드존(분리): 코너 세이브 제동(필요 4.7~6m/s^2)이 3.5 데드존을 반드시
+    # 초과해 '제동이 풀스로틀 직진보다 2.2배 손해'가 되는 역전이 있었다.
+    # 그립한계(~11.8m/s^2) 미만 제동은 무벌점, 브레이크체크급 급감속만 과세.
+    decel_deadzone: float = 9.0
+    # 종말 벌점(속도 의존): r_term = -(r_term_base + k_term_speed * v^2).
+    # 균일 -5 는 (a) 풀스피드 진행보상 15스텝치에 불과해 '직진-크래시 루프'의
+    # 평균 스텝보상이 정상 주행의 95%에 달했고 (b) 충돌 속도와 무관해 '이탈 직전
+    # 감속'의 한계이득이 0 이었다. 속도 의존화로 감속이 종말 비용을 직접 줄인다.
+    # (10m/s 충돌 -47, 6m/s -18.2, 2m/s 스침 -3.8)
+    # 0.3 -> 0.45: '감속 추종 없이 접근(A 뒤 0~3m 에서도 +3.3m/s) 후 마지막
+    # 회피'가 좁은 폭에서 벽으로 귀결 -> 고속 돌진의 실패 비용 상향(2026-07-12).
+    # 벽/추돌이 같은 공식을 공유하므로 어느 한쪽 선호로 왜곡되지 않는다.
+    r_term_base: float = 2.0
+    k_term_speed: float = 0.45
+    r_lap: float = 2.0
+    # ---- 경쟁 신호 ----
+    # (구) 연속 접근 보상 k_overtake*(ds-ds_opp): gap 을 닫는 동안 매 스텝 +가 되어
+    # "꽁무니 돌진"을 보상하는 부작용 -> 기본 0 (비활성, CLI 로만 실험).
+    k_overtake: float = 0.0
+    # 추월 '완료' 이벤트 보상: s 기준 뒤(gap<0)에서 앞(gap>=0)으로 교차한 스텝에 지급.
+    # 쿨다운(3초)으로 경계 왕복 파밍 방지. 랩 경계 오검출은 교차 폭 검사로 차단.
+    r_overtake: float = 2.0
+    overtake_cooldown: int = 90           # 스텝(=3초 @30Hz)
+    # 추돌 위험 근접 페널티: '뒤차'에만, 차간거리 [car_collision_dist, prox_dist]
+    # 선형 램프 × 접근속도 게이트. 거리를 유지하는 밀착 추종(불가피한 following)은
+    # 무벌점이고, 충돌 코스(거리가 줄어드는 중)일 때만 과세 -> "추월 시도 회피" 고착 방지.
+    k_proximity: float = 0.02
+    prox_dist: float = 1.0
+    prox_close_ref: float = 1.0           # 접근속도 정규화(m/s): 이 이상 접근 시 게이트=1
+    # ---- 스핀/슬라이드 (해석 타이어에서 제동+조향 콤바인드가 뒤축 그립을 잠식해
+    # 브레이크 오버스티어 스핀이 실제로 발생 — 실측: 스핀 직전 0.5초 감속 -10.5m/s²) ----
+    # 사이드슬립 데드존 벌점: |β|=atan2(|vy|,|vx|) 초과분 2차 (스텝당 최대 k_slip*4).
+    # 데드존(12°) 이내의 정상 코너링은 무벌점 — 하한 근거: 최급코너 그립 한계
+    # 코너링의 정상 β ≈ 10.7°(기하 4.7°+뒤타이어 슬립 6°), 이보다 내리면 정상
+    # 주행까지 과세된다.
+    # 이력: 0.1/0.26 에서는 클램프 상한(0.4/step) 탓에 깊은 드리프트(실측 maxβ
+    # p50=43°, 급코너를 그립한계 5.6 대비 7.5m/s 통과)가 순이익(벌점 2.4 <
+    # 시간이득 ~4)이라 '드리프트 코너링' 전략이 잔존 -> 0.3/0.21 로 상향
+    # (43° 드리프트 이벤트 비용 ~14 로 역전, 20260710_1 1.8M 계측 기반).
+    # 2026-08-07 소폭 완화(0.3/0.21 -> 0.25/0.26): 실차가 슬립 회피로 과보수 주행
+    #   (바깥벽 밀착). '아주 약간의 슬립'은 허용하도록 데드존을 15°(0.26rad, 지연 하
+    #   회복 가능 한계 ~15° 이내)로 넓히고 벌점 계수를 소폭 낮춘다. 깊은 드리프트는
+    #   여전히 slip_clamp(16)·종말벌점으로 억제되므로 스핀 안전은 유지.
+    # 2026-08-09 추가 완화(0.25/0.26 -> 0.20/0.30): 마찰 상향과 세트 실험. 코너에서
+    #   약간의 슬립을 더 허용해(데드존 15°->17.2°) 타이트/고속 라인을 유도, 계수도
+    #   소폭 하향. slip_clamp(16)·종말벌점은 유지하므로 깊은 드리프트/스핀 억제는 동일.
+    k_slip: float = 0.20
+    slip_deadzone: float = 0.30
+    # 2차항 상한. 구 4.0 은 β>36° 에서 벌점을 평탄화해 '깊은 드리프트일수록 더
+    # 아프다'는 그래디언트를 없앴다(1.8M 정책 드리프트 스텝의 35% 가 상한 포화).
+    # 16.0 이면 60° 까지 단조 증가 (43° 1.98/스텝, 60° 4.77/스텝).
+    slip_clamp: float = 16.0
+    # k_slip 커리큘럼: 신규 학습 초기의 강슬립벌점은 미숙련 정책의 속도 상승
+    # 경로를 차단해 저속 국소최적에 가둔다(20260712 실측: v 3.2 함정).
+    # v0 에서 시작해 ramp_steps 에 걸쳐 목표값(k_slip)으로 선형 상승.
+    # train.py 의 set_curriculum_progress(it) 가 갱신, 0 이면 비활성(항상 k_slip).
+    k_slip_v0: float = 0.1
+    k_slip_ramp_steps: int = 400_000
+    # 스핀 조기 종료: |헤딩오차| > 100° 는 회복 불능 스핀 — 속도 의존 종말 벌점으로
+    # 종료해 '스핀 후 후진 주행' 쓰레기 데이터가 버퍼를 오염시키는 것을 차단.
+    spin_herr_limit: float = 1.745
+    # ---- 스파링 상대(Car A) 속도 핸디캡 ----
+    # Car B(Pow, 실차 배포 대상)가 추월을 실제로 경험하도록 Car A(CVaR)의 명령
+    # 속도 상한을 에피소드(스폰)마다 이 범위에서 랜덤으로 뽑는다. None = 비활성.
+    # A 는 자기 상한을 관측하지 못하므로 A 의 주행 품질은 다소 희생된다(의도됨 —
+    # A 는 '다양한 속도의 이동 장애물' 역할). 추월 보상 파밍은 쿨다운(3초)이 방지.
+    v_cap_a_range: tuple | None = (4.0, 8.0)
+    # 종료/충돌
+    # |lateral| > 지역 half_width + margin -> 이탈 종료.
+    # 음수 마진: -0.15 = 차 가장자리(반폭 실측 0.15)가 덕트 내측면에 '닿는' 순간.
+    # -0.19 로 강화(2026-07-16): 시뮬이 벽에 수 cm 붙는 인코스를 학습했는데
+    # 실환경에서는 측위 오차/차체 요동으로 스침 위험 -> 벽과 4cm 안전 여유를
+    # 종료 경계에 내장해 정책이 그만큼 마진을 두고 달리게 한다.
+    offtrack_margin: float = -0.20
+    car_collision_dist: float = 0.45      # 두 차량 중심거리 < 이 값 -> 충돌 (전장 0.50 실측 반영)
+    # 스폰/리스폰 (개별 리스폰 시에도 주행 중인 상대와 이 간격을 유지해 배치)
+    spawn_min_gap_s: float = 3.0          # 두 차량 사이 최소 호길이 간격(m)
+    # 최대 간격: 30초 에피소드 안에 상호작용(추월 시도)이 실제로 일어나도록
+    # 가까이 스폰한다. 앞/뒤 방향은 50/50 랜덤.
+    spawn_max_gap_s: float = 12.0
+    # ---- 속도 커리큘럼 ----
+    # 탐험 노이즈 하 코너 생존율은 속도에 급감한다(pure-pursuit+마찰한계 실험,
+    # 노이즈 std 0.15 기준: 4m/s 이탈 0회/100m, 6m/s 0.8회, 8m/s 5.6회).
+    # 명령 속도 상한을 v0 에서 v_max 로 램프해 '저속에서 조향 먼저, 고속은 점진'
+    # 경로를 만든다. train.py 가 매 iteration set_curriculum_progress(it) 호출.
+    # 관측 정규화는 항상 /v_max 라 커리큘럼과 무관(관측 비정상성 없음).
+    # curriculum_steps=0 이면 비활성(test.py 등은 호출 안 하므로 항상 v_max).
+    curriculum_v0: float = 6.0
+    curriculum_steps: int = 300_000
+    # 관측 차원
+    n_opp_feats: int = 5
+    # 차량 동역학 관측 정규화 (2026-07-14 추가: 요레이트+횡속도 — 실차 IMU 자이로와
+    # 횡속도 추정치를 같은 스케일로 넣을 것. 미세 조향 피드백 제어(요 감쇠)에 필수 —
+    # 없으면 정책이 PWM/뱅뱅 조향으로만 요를 제어한다)
+    yawrate_norm: float = 4.0             # rad/s (그립한계 요레이트 ~3.4 + 여유)
+    vy_norm: float = 3.0                  # m/s
+    # ---- 실차 루프 지연 (sim2real, 2026-07-20) ----
+    # 실측: 측위 110ms + 추론 20ms = 130ms = 3.9 제어스텝(30Hz).
+    # 이 지연은 무시할 수준이 아니다 — 요 시정수 τ=21~53ms 대비 2.4~6.1배이고,
+    # 요 대역(3.75Hz@8m/s)에서 위상지연 175°(위상여유 소진). 실측 영향:
+    # 사용가능 피드백게인 9배 감소, 경로 정착시간 2.2배, **복구 가능 최대
+    # 사이드슬립 ≥60° -> ~15°** (scratchpad/delay_analysis3.py, 2-DOF 자전거모델).
+    # -> 드리프트는 실차에서 사실상 회복 불가이므로 slip 벌점과 세트로 간다.
+    #
+    # ★ 실차 스택 확정 반영(2026-07-22): 측위가 EKF 100Hz 융합이다.
+    #   EKF 는 IMU 로 상태를 100Hz 로 propagate 하고 LiDAR 관측(10~20Hz, 110ms
+    #   지연)이 도착할 때 correct 하므로, 출력 pose 는 '현재 시각' 추정치다
+    #   -> 측위 지연 110ms 는 사실상 소거되고 '추정 오차'(관측 노이즈)로만 남는다.
+    #   잔여 지연 = EKF propagate 10ms + 추론 20ms + 명령 전달 5ms ≈ 35ms ≈ 1스텝.
+    #   따라서 (1,3)=33~100ms -> (0,2)=0~67ms (중앙 1스텝=33ms, 실측 추정과 일치).
+    #   지연이 크면 정책이 위험 회피로 느려지므로, 과대 지연은 곧 과보수 주행이다.
+    #   EKF 없이 raw LiDAR pose 를 쓴다면 (2,5) 로 되돌릴 것.
+    # 고정이 아니라 범위 랜덤화: 실지연은 LiDAR 누적/스케줄링으로 흔들리고,
+    # 범위로 학습해야 배포 시 지연 오차에 강건하다. 지연값은 관측하지 않는다
+    # (표준 도메인 랜덤화 — 범위가 좁아 robust 정책으로 충분).
+    act_delay_min: int = 0
+    act_delay_max: int = 2
+    # 지연 하에서 상태는 비-마르코프가 된다: '아직 인가되지 않고 배송 중인 명령'이
+    # 미래를 좌우하는데 관측에 없기 때문. 최근 K개 '명령' 행동을 관측에 넣어
+    # 마르코프 성질을 복원한다 (K >= act_delay_max 이어야 창 전체를 덮는다).
+    # 4 -> 2 (2026-07-25): 측위 지연이 EKF 100Hz 융합으로 소거되어 act_delay_max 가
+    # 2 로 줄었으니(구: 긴 측위 지연 가정으로 3~5스텝 창을 4로 덮었음), K =
+    # act_delay_max = 2 가 창을 정확히 덮는 최소값이다. 스텝 t+1 결정 시 '배송 중
+    # (미인가)' 명령은 최악(d=2)에도 {cmd_t, cmd_{t-1}} 둘뿐이라 히스토리 2로 충분하고,
+    # cmd_{t-2..} 는 어떤 in-flight 명령과도 대응하지 않는 잉여 관측(정책 입력 차원만
+    # 늘림)이었다. obs_dim 62->58 (체크포인트 비호환 — 어차피 물리 변경으로 재학습 필요).
+    act_hist_len: int = 2
+
+    def obs_dim(self) -> int:
+        # scan + speed + herr(sin,cos) + lateral + curvature + width(현재+lookahead)
+        # + 행동히스토리(act_hist_len x 2) + opp + [요레이트, 횡속도]
+        n_width = 1 + len(self.curv_lookahead)
+        return (self.n_beams + 1 + 2 + 1 + len(self.curv_lookahead) + n_width
+                + 2 * self.act_hist_len + self.n_opp_feats + 2)
+
+    def act_dim(self) -> int:
+        return 2
+
+
+@configclass
+class RacingEnvCfg(DirectRLEnvCfg):
+    # 런타임 결정값 (train.py 에서 채움)
+    decimation: int = 4
+    episode_length_s: float = 30.0
+    action_space: int = 4                 # = 2 cars * 2 act_dim
+    observation_space: int = 1            # 미사용(우리는 dict 관측 사용) — 형식상 채움
+    state_space: int = 0
+
+    sim: SimulationCfg = SimulationCfg(
+        dt=1.0 / 120.0,
+        render_interval=4,
+        # 2048 envs x 2 cars: 바퀴 4개+섀시 접촉만으로도 2**12(4096)를 초과해
+        # 접촉이 유실된다(차량 침하/관통). 2**18(262144)이면 여유. (PhysX 기본 2**23)
+        physx=PhysxCfg(gpu_max_rigid_contact_count=2**18),
+    )
+
+    # 평면 위에서 주행 (트랙은 해석적 = 충돌메시 불필요)
+    # ★ 지면 마찰 = 0 (combine=min 으로 타이어 재질과 무관하게 0 보장).
+    # 바퀴-지면 접촉은 '수직 지지 + 차체 자세 유지' 전용이고, 수평 타이어 힘
+    # (횡력/구동/제동)은 TireModelCfg 의 해석 모델이 섀시 외력으로 인가한다.
+    # (강체 접촉 마찰은 고속 회전 바퀴에서 붕괴 — TireModelCfg docstring 참조)
+    terrain: TerrainImporterCfg = TerrainImporterCfg(
+        prim_path="/World/ground",
+        terrain_type="plane",
+        collision_group=-1,
+        physics_material=RigidBodyMaterialCfg(
+            static_friction=0.0,
+            dynamic_friction=0.0,
+            restitution=0.0,
+            friction_combine_mode="min",
+        ),
+    )
+
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+        num_envs=2048,
+        env_spacing=40.0,    # track_field.suggested_env_spacing 로 train.py 에서 덮어씀
+        replicate_physics=True,
+    )
+
+    racing: RacingCfg = RacingCfg()
+    tire: TireModelCfg = TireModelCfg()
+    track_field: TrackFieldCfg = TrackFieldCfg()
+    project_dir: str = MISSING
+    # 디버깅용 벽 시각화(물리 없음, 렌더 전용). 스테이지 생성이 env 수에 비례해
+    # 느려지므로 num_envs 가 작을 때(GUI 확인용)만 켤 것.
+    wall_visuals: bool = False

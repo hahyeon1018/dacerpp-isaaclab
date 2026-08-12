@@ -1,0 +1,7 @@
+image: teras.png
+mode: trinary
+resolution: 0.05
+origin: [-19.121859, -9.373819, -0.437994]
+negate: 0
+occupied_thresh: 0.065
+free_thresh: 0.25

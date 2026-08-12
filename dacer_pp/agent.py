@@ -48,7 +48,11 @@ class DACERpp:
         self.device = torch.device(cfg.device)
         self.step = 0
         self._entropy = 0.0
-        self.target_entropy = -cfg.act_dim * cfg.target_entropy_scale
+        # 명시 지정(cfg.target_entropy)이 있으면 그것을, 없으면 구 규칙을 쓴다.
+        # 구 규칙(-act_dim*0.9=-1.8)은 이 정책이 도달할 수 없는 값이라 alpha 를
+        # 상한에 고정시킨다 — config.DACERppConfig.target_entropy 주석 참조.
+        self.target_entropy = (float(cfg.target_entropy) if cfg.target_entropy is not None
+                               else -cfg.act_dim * cfg.target_entropy_scale)
         torch.manual_seed(cfg.seed)
 
         def make_qvn():

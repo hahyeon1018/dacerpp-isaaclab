@@ -6,7 +6,7 @@
 - build_track_mesh : 중심선 -> 노면(road) + 좌/우 벽(walls) trimesh 생성.
 
 좌표계: 트랙은 캐논컬 로컬 프레임(원점 중심)에서 생성된다.
-실제 배치(2048개 그리드)는 track_field.py 가 원점을 평행이동해 처리한다.
+실제 배치(4096개 그리드)는 track_field.py 가 원점을 평행이동해 처리한다.
 """
 from __future__ import annotations
 

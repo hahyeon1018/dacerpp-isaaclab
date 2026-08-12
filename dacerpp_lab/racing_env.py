@@ -1,7 +1,8 @@
 """DACER++ 레이싱 DirectRLEnv (각 환경에 2대: car_a=CVaR, car_b=Pow).
 
 설계 요지
-  - num_envs = 트랙 수(예 2048). 각 환경에 car_a, car_b 두 대 스폰.
+  - num_envs = 환경 수(기준 4096). 각 환경에 car_a, car_b 두 대 스폰.
+    트랙은 competition_tracks 512종을 env i -> track (i % 512) 로 균형 배정.
   - 물리는 평면. 트랙은 중심선+가변 폭 프로파일(1~5m, 실 대회장 덕트 간격)로
     해석적 정의(이탈=종료). 이탈판정/보상/관측 정규화는 지역 half-width 기준.
   - 스캔은 좌/우 벽 폴리라인(덕트) 레이캐스트 + 상대차량 footprint 오버레이.
@@ -129,6 +130,13 @@ class RacingEnv(DirectRLEnv):
 
         # 빔 각도(전방 중심 ±fov)
         self._beam_angles = torch.linspace(-rc.scan_fov, rc.scan_fov, rc.n_beams, device=dev)
+        # 섹터 축약용 빔 내 오프셋: 각 빔의 섹터(폭 spacing)를 균등 분할한 S개 레이.
+        # S=1 -> [0] (구 동작, 빔 각 그대로). S=3 -> [-spacing/2, 0, +spacing/2].
+        # (env_cfg.scan_sector_rays 주석 참조 — 실차 의사 스캔의 '섹터 최소거리' 모사)
+        spacing = 2.0 * rc.scan_fov / max(rc.n_beams - 1, 1)
+        S = max(1, int(rc.scan_sector_rays))
+        self._sector_offsets = (torch.zeros(1, device=dev) if S == 1 else
+                                torch.linspace(-0.5 * spacing, 0.5 * spacing, S, device=dev))
 
         # 속도 커리큘럼: 명령 속도 상한(행동 -> 속도 매핑의 상단).
         # train.py 가 매 iteration set_curriculum_progress(it) 로 갱신하고,
@@ -726,12 +734,12 @@ class RacingEnv(DirectRLEnv):
             (speed / max(rc.v_max, 1e-6)).unsqueeze(1),             # 1
             torch.stack([torch.sin(herr_o), torch.cos(herr_o)], 1),  # 2
             (lat_o / hw_local).clamp(-2, 2).unsqueeze(1),           # 1  (±1 = 벽)
-            # 곡률: -1..1 -> -2..2 (2026-07-30 실차 분석 [9].2). 실제 대회 코스는
-            # |κ|이 1.93(R 0.52m)까지 가는데 구 클립(±1)은 1.0 이상을 전부 1.0으로
-            # 뭉개 정책이 '급코너 vs 아주 급한 코너'를 구분 못 했다(헤어핀 대응 실패의
-            # 한 축). 새 대회 트랙(급함 밴드 |κ|max~1.9)의 세기를 관측에 노출한다.
-            # 하한 -2 스케일은 위 lateral 채널(±2)과 동일 관례라 입력 스케일 일관.
-            curv.clamp(-2, 2),                                      # k
+            # 곡률 클립: ±1 -> ±2(2026-07-30) -> ±3(2026-08-12, env_cfg.curv_clip).
+            # 클립이 실제 코스의 |κ|max 보다 작으면 정책은 '급코너'와 '헤어핀'을
+            # 관측상 구분하지 못한다 — 신규 연습 맵(|κ|max 2.78/2.43)에서 ±2 가
+            # 정확히 그 상태였고, 실차가 그 코너에서 덜 꺾어 벽에 박았다.
+            # (근거/측정은 env_cfg.RacingCfg.curv_clip 주석)
+            curv.clamp(-rc.curv_clip, rc.curv_clip),                # k
             (width / self._hw_ref).clamp(0, 1),                     # 1+k (현재/전방 폭)
             act_hist.clamp(-1, 1),                                  # 2*act_hist_len
             opp,                                                    # 5
@@ -748,28 +756,61 @@ class RacingEnv(DirectRLEnv):
         상대차 가시성(벽 가림) 판정에 사용한다.
 
         실차(F1TENTH, 원형 덕트 벽 + Livox 3D LiDAR) 대응 파이프라인:
-          IMU deskew -> 지면 위 높이 밴드(예: 0.05~덕트 높이) 필터 ->
+          deskew -> 지면 위 높이 밴드(예: 0.05~덕트 높이) 필터 ->
           차체 기준 ±scan_fov 를 n_beams 개 방위각 섹터로 분할 ->
           섹터별 최소 거리 -> scan_max_range 클립 -> /scan_max_range 정규화.
-        Livox 비반복 패턴은 ~100ms 누적으로 섹터가 균일하게 채워지며,
-        누적 지연은 IMU 기반 포즈 전방 예측으로 보상할 것.
+
+        ★2026-08-12 '섹터별 최소 거리'를 실제로 모사하도록 수정. 구 코드는 빔 각으로
+          레이를 하나만 쏴서, 실차의 섹터 축약(8.71° 폭 안 점들의 min)보다 구조적으로
+          멀게 읽었다 — 실제 맵에서 측정한 편향 평균 +0.17m, 빔의 52%가 학습 노이즈
+          (0.035m)보다 큰 오차. 빔당 scan_sector_rays 개 레이의 min 으로 바꾸니
+          편향 -0.003m, 오차>0.035m 인 빔 0.0% 로 사라진다(S=3 기준, S=5 는 개선 없음).
+
+        ★스캔/측위 지연에 대한 확인(2026-08-12): 실차 EKF(ekf_localizer)는
+          predict_frequency 100Hz + extend_state_step 80(=0.8s 버퍼)로 지연 관측을
+          updateWithDelay 로 시각 정렬 융합하므로 출력 pose 는 '현재 시각' 추정치이고,
+          rl_controller 의 scan_builder 는 점마다 측정 시각 pose 로 되돌린 뒤 현재
+          차체 프레임으로 옮긴다(deskew). 따라서 Livox 100ms 스윕 누적은 '정지한 벽'에
+          대해서는 기하학적으로 보상된다 -> act_delay_min/max=(0,2) 유지가 맞다.
+          (실측 pose 지연 mean 142ms / p95 163ms 는 모두 0.8s 버퍼 안이다.)
         """
         rc = self.cfg.racing
-        ang_w = yaw.unsqueeze(1) + self._beam_angles.unsqueeze(0)   # (N,B) 월드 기준 빔 각
-        # 각도 지터(sim2real): 실측 Livox/섹터축약의 각 불확실성 -> 경사벽에서 거리 요동.
+        # 섹터 축약 모사: 빔마다 섹터(폭 2*fov/(B-1))를 가로지르는 S개 레이를 쏘고
+        # 최소값을 취한다 — 실차 의사 스캔이 '섹터 안 점들의 최소 거리'이기 때문
+        # (env_cfg.scan_sector_rays 주석: 편향 평균 -0.21m). S=1 이면 구 동작.
+        # _sector_offsets 는 (S,) 로 __init__ 에서 만들어 둔다.
+        ang_b = (self._beam_angles.unsqueeze(1)                     # (B,1)
+                 + self._sector_offsets.unsqueeze(0)).reshape(-1)   # (B*S,)
+        ang_w = yaw.unsqueeze(1) + ang_b.unsqueeze(0)               # (N,B*S) 월드 기준
+        # 각도 지터(sim2real): 섹터 축약으로 못 잡는 잔여 각 불확실성(Livox 자체 오차).
         # 각을 흔들어 raycast 하면 그 요동이 물리적으로 재현된다(평가 시 obs_noise=False).
         if rc.obs_noise and rc.scan_angle_jitter > 0:
             ang_w = ang_w + (torch.rand_like(ang_w) * 2 - 1) * rc.scan_angle_jitter
         try:
-            scan = self._raycast_fn(local_xy, ang_w, self._track_type, idx0,
+            rays = self._raycast_fn(local_xy, ang_w, self._track_type, idx0,
                                     rc.raycast_half_window, rc.scan_max_range)
         except Exception:
             if self._raycast_fn is self._vt.raycast:
                 raise
             print("[RacingEnv] compiled raycast failed; falling back to eager.")
             self._raycast_fn = self._vt.raycast
-            scan = self._vt.raycast(local_xy, ang_w, self._track_type, idx0,
+            rays = self._vt.raycast(local_xy, ang_w, self._track_type, idx0,
                                     rc.raycast_half_window, rc.scan_max_range)
+        S = self._sector_offsets.shape[0]
+        reduce_sector = (lambda r: r.reshape(r.shape[0], rc.n_beams, S).amin(dim=2)) \
+            if S > 1 else (lambda r: r)
+        # 벽 전용 스캔(상대차 가시성=벽 가림 판정용). 섹터 축약 후 빔 해상도로 돌린다.
+        scan = reduce_sector(rays)
+        # 장애물 footprint 는 '축약 전' 레이 해상도에서 합성한다 — 실차에서도 장애물은
+        # 섹터 안 점군으로 잡혀 그 섹터의 최소거리를 끌어내리기 때문(빔 각에만 얹으면
+        # 섹터 폭 안에 있는데도 놓치는 경우가 생긴다).
+        # 활성 장애물이 하나도 없으면(무장애 env 또는 평가) 건너뛴다.
+        if rc.obstacles_enabled and bool(self._obs_active.any()):
+            rays = overlay_obstacles(rays, local_xy, ang_w, self._obs_verts,
+                                     self._obs_active, rc.scan_max_range)
+            scan_wo = reduce_sector(rays)
+        else:
+            scan_wo = scan
         # ---- 상대차 감지 박스 오버레이 (구 원형 opp_radius 대체) ----
         # 실차는 상대차 뒷부분 감지 박스(12×12cm, 10~30cm 높이)만 LiDAR 로 검출한다.
         # 박스 중심(차중심에서 뒤로 det_box_rear)을 등가 원판으로 스캔에 반영하되,
@@ -783,15 +824,10 @@ class RacingEnv(DirectRLEnv):
         box_cx = bx - rc.det_box_rear * torch.cos(rel_yaw)  # 감지박스 중심(뒷부분)
         box_cy = by - rc.det_box_rear * torch.sin(rel_yaw)
         half_sector = rc.scan_fov / max(rc.n_beams - 1, 1)  # = beam_spacing/2
-        overlaid = overlay_opponent(scan, self._beam_angles,
+        overlaid = overlay_opponent(scan_wo, self._beam_angles,
                                     torch.stack([box_cx, box_cy], dim=1),
                                     rc.scan_max_range, rc.det_box_size * 0.70711,
                                     min_half_ext=half_sector)
-        # 장애물 footprint 를 정책 스캔에 반영 (벽전용 scan 은 상대 가시성 판정용이라 유지).
-        # 활성 장애물이 하나도 없으면(무장애 env 또는 평가) 건너뛴다.
-        if rc.obstacles_enabled and bool(self._obs_active.any()):
-            overlaid = overlay_obstacles(overlaid, local_xy, ang_w, self._obs_verts,
-                                         self._obs_active, rc.scan_max_range)
         return scan, overlaid
 
     def _get_observations(self):

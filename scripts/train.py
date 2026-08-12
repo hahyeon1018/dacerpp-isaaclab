@@ -2,13 +2,13 @@
 """DACER++ 듀얼 에이전트 학습 (Isaac Lab).
 
 각 환경에 2대: car_a = CVaR(보수), car_b = Pow(공격).
-2048대 car_a 는 하나의 CVaR 파라미터를 공유 학습, 2048대 car_b 는 하나의 Pow 파라미터를 공유 학습.
+4096대 car_a 는 하나의 CVaR 파라미터를 공유 학습, 4096대 car_b 는 하나의 Pow 파라미터를 공유 학습.
 
 실행:
   conda activate env_isaaclab
-  python scripts/train.py --num_envs 2048 --headless
+  python scripts/train.py --num_envs 4096 --headless
   # 이어서 학습 (예: 20260706 폴더의 가중치에서 재개):
-  python scripts/train.py --num_envs 2048 --headless --resume_dir dacerpp_runs/20260706
+  python scripts/train.py --num_envs 4096 --headless --resume_dir dacerpp_runs/20260706
 """
 from __future__ import annotations
 
@@ -26,11 +26,17 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--num_envs", type=int, default=4096)
 parser.add_argument("--iterations", type=int, default=10_000_000)
 parser.add_argument("--warmup", type=int, default=5_000)
-parser.add_argument("--utd", type=int, default=2, help="환경스텝당 그래디언트 업데이트 수")
+parser.add_argument("--utd", type=int, default=4, help="환경스텝당 그래디언트 업데이트 수")
 parser.add_argument("--batch_size", type=int, default=2048)
 parser.add_argument("--buffer_size", type=int, default=6_000_000)
 parser.add_argument("--save_every", type=int, default=50_000)
-parser.add_argument("--save_dir", type=str, default=os.path.expanduser("~/Desktop/hahyeon/dacerpp_isaaclab/dacerpp_runs"),
+# 기본 저장 경로는 '이 스크립트가 있는 저장소' 안으로 잡는다.
+# (구 기본값은 ~/Desktop/hahyeon/dacerpp_isaaclab/... 밑줄 표기라 실제 폴더명
+#  dacerpp-isaaclab 과 어긋났고, os.makedirs 가 부모까지 만들어 버려 체크포인트가
+#  조용히 저장소 밖에 쌓였다.)
+_DEFAULT_SAVE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dacerpp_runs")
+parser.add_argument("--save_dir", type=str, default=_DEFAULT_SAVE_DIR,
                     help="이 아래에 실행마다 날짜명 폴더(예: 20260706)를 만들어 저장")
 parser.add_argument("--resume_dir", type=str, default=None,
                     help="이어서 학습할 체크포인트 폴더(cvar.pt/pow.pt 위치). 미지정 시 처음부터 학습")
@@ -50,6 +56,15 @@ parser.add_argument("--k_accel", type=float, default=None,
                     help="종가속도 벌점 계수 (미지정 시 env_cfg 기본값 0.05)")
 parser.add_argument("--no_compile", action="store_true",
                     help="torch.compile/CUDA Graphs 비활성화 (디버깅용)")
+parser.add_argument("--collapse_pstd", type=float, default=0.02,
+                    help="이 값 이상의 조향 다양성(pstd)을 유지하는 동안만 *_healthy.pt 를 "
+                         "갱신한다. 기본 0.02 = collapse_metrics 가 명시한 붕괴 기준")
+parser.add_argument("--mu_range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="지면 마찰 도메인 랜덤화 범위 덮어쓰기 (예: --mu_range 0.45 0.75). "
+                         "여러 머신에서 마찰만 바꿔 스윕할 때 사용")
+parser.add_argument("--curv_clip", type=float, default=None,
+                    help="전방 곡률 관측 클립(±) 덮어쓰기. 미지정 시 env_cfg 기본값(3.0). "
+                         "★배포 rl_controller.yaml 의 curv_clip 과 반드시 같은 값을 쓸 것")
 parser.add_argument("--wall_visuals", action="store_true",
                     help="덕트 벽 렌더 전용 시각화 (GUI + 작은 num_envs 로 확인용)")
 AppLauncher.add_app_launcher_args(parser)
@@ -116,6 +131,17 @@ def main():
     # ---- 환경 ----
     cfg = RacingEnvCfg()
     cfg.scene.num_envs = args.num_envs
+    # PhysX 접촉 버퍼는 env 수에 비례해야 한다. 구 값 2**18 은 env 당 128 이라
+    # 기준인 4096 envs 에서는 env 당 64 로 쪼그라들어 접촉이 유실된다
+    # (차량이 지면으로 가라앉거나 관통 -> flip 종료 폭증).
+    # 이 실패는 물리 쪽에서 조용히 나타나 원인 추적이 어려우므로 넉넉히 잡는다:
+    #   하한 2**19 + env 당 256. (2048 -> 2**19, 4096 -> 2**20)
+    # 비용은 무시할 수준이다 — PhysX 기본값이 2**23 이라 이보다도 8~16배 작고,
+    # 접촉 엔트리는 수십 바이트라 2**20 이어도 100MB 안쪽이다. 실제 필요량은
+    # env 당 바퀴 4개 x 2대 = 8 접촉 + 전복/차간 접촉 정도라 여유가 매우 크다.
+    # gpu_max_rigid_patch_count 는 기본값(5*2**15=163840)으로 충분하다
+    # (4096 envs 에서 접촉 쌍 ~32768).
+    cfg.sim.physx.gpu_max_rigid_contact_count = max(2 ** 19, 256 * args.num_envs)
     cfg.project_dir = project_dir
     cfg.track_field.num_envs = args.num_envs
     if args.all_tracks:                      # f1tenth + 절차 포함(일반화)
@@ -132,6 +158,11 @@ def main():
         cfg.racing.k_overtake = args.k_overtake
     if args.k_accel is not None:
         cfg.racing.k_accel = args.k_accel
+    # 머신별 스윕용 덮어쓰기 (기본값은 env_cfg 그대로)
+    if args.mu_range is not None:
+        cfg.tire.mu_range = (float(args.mu_range[0]), float(args.mu_range[1]))
+    if args.curv_clip is not None:
+        cfg.racing.curv_clip = float(args.curv_clip)
     # gym 공간 정합 (dict 관측의 "policy" 키 = 두 차량 관측 concat)
     cfg.observation_space = 2 * cfg.racing.obs_dim()
     # 트랙이 서로 안 겹치도록 그리드 간격을 트랙 크기에 맞춤
@@ -147,7 +178,7 @@ def main():
     print(f"[INFO] envs={N} obs_dim={obs_dim} act_dim={act_dim} spacing={spacing:.1f}m "
           f"device={device} compile={not args.no_compile}")
 
-    # ---- 두 에이전트 (파라미터 분리, 각자 2048대 공유) ----
+    # ---- 두 에이전트 (파라미터 분리, 각자 num_envs 대 공유) ----
     def make_agent(risk, seed):
         c = DACERppConfig(obs_dim=obs_dim, act_dim=act_dim, risk=risk,
                           batch_size=args.batch_size, device=device,
@@ -182,8 +213,47 @@ def main():
             f.write("it,alpha_cvar,alpha_pow,ent_cvar,ent_pow,"
                     "pstd_a_steer,pstd_a_thr,qspread_a,"
                     "pstd_b_steer,pstd_b_thr,qspread_b,"
-                    "v_cap,k_slip,mu_min,mu_max,r_a,r_b,term\n")
+                    "v_cap,k_slip,mu_min,mu_max,r_a,r_b,term,"
+                    # 종료 원인 분해(차량별 평균, 스텝당 비율) — 어떤 실패가 지배적인지
+                    # 사후에 알 수 있어야 파라미터를 옳게 되돌릴 수 있다.
+                    "off_a,off_b,crash_a,crash_b,flip_a,flip_b,"
+                    "spun_a,spun_b,obs_a,obs_b\n")
+    # ---- 사전붕괴(pre-collapse) 체크포인트 보존 ----
+    # 20260810 배포 가중치의 조향 다양성 pstd 는 0.0105 로, collapse_metrics 가
+    # 명시한 붕괴 기준(0.02)보다도 낮았다. 붕괴는 서서히 진행되는데 저장은 항상
+    # 최신본을 덮어써서, 사후에 '아직 건강하던 시점'으로 되돌아갈 수가 없었다.
+    # -> pstd 가 이 기준 위인 동안에는 별도 파일로도 계속 갱신해 둔다.
+    healthy_cvar = os.path.join(run_dir, "cvar_healthy.pt")
+    healthy_pow = os.path.join(run_dir, "pow_healthy.pt")
+    healthy_meta = os.path.join(run_dir, "healthy_meta.json")
     print(f"[INFO] checkpoint dir: {run_dir}")
+    # ---- 실행 조건 기록 ----
+    # 여러 머신에서 파라미터만 바꿔 스윕할 때, 나중에 어느 체크포인트가 어떤 조건이었는지
+    # 알 수 없으면 비교 자체가 성립하지 않는다. 실차 재현에 필요한 값만 골라 남긴다.
+    with open(os.path.join(run_dir, "run_config.json"), "w") as f:
+        json.dump({
+            "num_envs": args.num_envs, "batch_size": args.batch_size, "utd": args.utd,
+            # 리플레이 비율 = 수집 1건당 학습에 쓰이는 샘플 수. num_envs 를 바꾸면
+            # 이 값이 바뀌어 학습 동역학 자체가 달라지므로 런 비교 시 반드시 확인할 것.
+            "replay_ratio": round(args.utd * args.batch_size / max(args.num_envs, 1), 3),
+            "buffer_size": args.buffer_size, "warmup": args.warmup,
+            "cvar_eta": args.cvar_eta, "pow_eta": args.pow_eta,
+            "mu_range": list(cfg.tire.mu_range) if cfg.tire.mu_range else None,
+            "curv_clip": cfg.racing.curv_clip,
+            "scan_sector_rays": cfg.racing.scan_sector_rays,
+            "scan_noise_std": cfg.racing.scan_noise_std,
+            "scan_angle_jitter": cfg.racing.scan_angle_jitter,
+            "act_delay": [cfg.racing.act_delay_min, cfg.racing.act_delay_max],
+            "act_hist_len": cfg.racing.act_hist_len,
+            "v_max": cfg.racing.v_max, "v_min": cfg.racing.v_min,
+            "max_steering_angle": cfg.racing.max_steering_angle,
+            "r_term_base": cfg.racing.r_term_base, "k_term_speed": cfg.racing.k_term_speed,
+            "k_slip": cfg.racing.k_slip, "slip_deadzone": cfg.racing.slip_deadzone,
+            "k_smooth_steer": cfg.racing.k_smooth_steer,
+            "obstacles_enabled": cfg.racing.obstacles_enabled,
+            "num_tracks": int(env._field.num_track_types),
+            "all_tracks": bool(args.all_tracks), "resume_dir": args.resume_dir,
+        }, f, indent=2, ensure_ascii=False)
 
     # ---- 재개(resume): --resume_dir 폴더의 체크포인트 로드 ----
     # 가중치(policy/Q-net/alpha/step)는 복원되지만 리플레이 버퍼는 저장되지 않으므로
@@ -233,7 +303,9 @@ def main():
             for _ in range(args.utd):
                 m_p = agent_pow.update(buf_pow.sample(args.batch_size))
 
-        if it % 200 == 0 and len(buf_cvar) > args.warmup:
+        # 두 버퍼는 매 스텝 같은 개수를 담지만, 로깅이 m_c/m_p 를 모두 읽으므로
+        # 두 조건을 함께 건다(한쪽만 warmup 을 넘긴 순간의 NameError 방지).
+        if it % 200 == 0 and min(len(buf_cvar), len(buf_pow)) > args.warmup:
             # 지표는 0-d 텐서(지연 동기화) -> 로깅 시점에만 float() 변환
             print(f"[{it}] CVaR q1={float(m_c.get('q1_loss', 0)):.3f} a={float(m_c['alpha']):.2f} "
                   f"r_a={di['rew_a'].mean().item():.3f} | "
@@ -250,6 +322,11 @@ def main():
                   f"qspread={float(qb_m):.3f} | v_cap={env._v_cmd_max:.1f}m/s "
                   f"k_slip={env._k_slip_cur:.2f} "
                   f"mu=[{env._mu.min().item():.2f},{env._mu.max().item():.2f}]")
+            cz = di["causes"]
+            cause_txt = ",".join(
+                f"{cz[k].float().mean().item():.5f}" for k in
+                ("off_a", "off_b", "crash_a", "crash_b", "flip_a", "flip_b",
+                 "spun_a", "spun_b", "obs_a", "obs_b"))
             with open(collapse_csv, "a") as f:
                 f.write(
                     f"{it},{float(m_c['alpha']):.4f},{float(m_p['alpha']):.4f},"
@@ -259,7 +336,20 @@ def main():
                     f"{env._v_cmd_max:.2f},{env._k_slip_cur:.3f},"
                     f"{env._mu.min().item():.3f},{env._mu.max().item():.3f},"
                     f"{di['rew_a'].mean().item():.4f},{di['rew_b'].mean().item():.4f},"
-                    f"{(di['term_a'] | di['term_b']).float().mean().item():.4f}\n")
+                    f"{(di['term_a'] | di['term_b']).float().mean().item():.4f},"
+                    f"{cause_txt}\n")
+
+            # 사전붕괴 스냅샷: 배포 대상(Pow=car_b)의 조향 다양성이 기준 위인 동안만 갱신.
+            # 붕괴 후 학습을 계속해도 '마지막 건강한 가중치'가 남는다.
+            if float(sb_m[0]) >= args.collapse_pstd:
+                agent_cvar.save(healthy_cvar)
+                agent_pow.save(healthy_pow)
+                with open(healthy_meta, "w") as f:
+                    json.dump({"it": it, "pstd_b_steer": float(sb_m[0]),
+                               "pstd_a_steer": float(sa_m[0])}, f)
+            elif it % 2000 == 0:
+                print(f"      [warn] Pow 조향 다양성 pstd={float(sb_m[0]):.4f} < "
+                      f"{args.collapse_pstd} — 붕괴 영역. 배포는 pow_healthy.pt 를 쓸 것.")
 
         if it > 0 and it % args.save_every == 0:
             agent_cvar.save(cvar_path)

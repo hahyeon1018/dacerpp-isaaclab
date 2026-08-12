@@ -31,7 +31,7 @@ from .tracks import (make_centerline, make_width_profile, TrackParams, NUM_LAYOU
 
 @dataclass
 class TrackFieldCfg:
-    num_envs: int = 2048
+    num_envs: int = 4096
     difficulty: float = 0.6                # 절차 트랙 난이도 (고정 분포)
     params: TrackParams = field(default_factory=TrackParams)
     start_lateral_offset: float = 0.6      # 두 차량 좌/우 출발 간격(m)

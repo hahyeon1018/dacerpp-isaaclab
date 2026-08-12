@@ -54,10 +54,24 @@ class DACERppConfig:
     init_log_alpha: float = 0.0           # alpha=1.0 (첫 alpha 갱신 때 상한으로 클램프)
     max_log_alpha: float = -0.62          # ln(0.538) -> 노이즈 std 0.081 (20260726 안전값)
     min_log_alpha: float = -4.6           # ln(0.01): 수치 폭주 방지
-    target_entropy_scale: float = 0.9
+    target_entropy_scale: float = 0.9     # target_entropy=None 일 때만 사용 (-act_dim*scale)
+    # ★2026-08-12 target_entropy 명시 지정.
+    # 문제: 구 기본값 -act_dim*0.9 = -1.8 은 이 정책 파라미터화로 '도달 불가능'하다.
+    #   20260808~20260810 네 런 전체 로그에서 추정 엔트로피는 -5.8 ~ -7.1 이었고,
+    #   그 결과 alpha 손실이 항상 같은 방향으로만 밀려 alpha 가 모든 로그 시점에서
+    #   정확히 exp(max_log_alpha)=0.5379 에 고정됐다 = 적응 루프가 상수로 퇴화.
+    #   (config 구 주석도 "alpha 는 항상 상한에 붙는다"고 적고 있었다.)
+    # 측정된 대응관계: 조향 다양성 pstd 0.030(초기, 건강) ↔ H ≈ -6.3,
+    #                  pstd 0.0105(20260810 배포, 붕괴) ↔ H ≈ -7.1.
+    # -> -6.3 으로 두면 붕괴 쪽(H<-6.3)에서는 alpha 를 올려 탐험을 유지하고,
+    #    다양성이 회복되면(H>-6.3) alpha 를 내릴 '하향 권한'이 처음으로 생긴다.
+    # ※ 이것만으로 붕괴가 막히지는 않는다 — 액터 손실(-Q.mean())에 엔트로피 항이
+    #    없어 정책이 argmax 로 굳는 것은 DACER 구조상 정상이다. 붕괴 대응의 본체는
+    #    train.py 의 pstd 기반 사전붕괴 체크포인트 보존이다.
+    target_entropy: float | None = -6.3
     entropy_num_samples: int = 64     # 원본 200
     entropy_num_components: int = 3
-    entropy_obs_batch: int = 256      # GMM 엔트로피 추정에 쓸 상태 수(sklearn CPU fit 이라 배치 전체는 과도)
+    entropy_obs_batch: int = 256      # GMM 엔트로피 추정에 쓸 상태 수 (GPU EM, entropy.estimate_entropy_torch)
     explore_noise_scale: float = 0.15
     # ---- torch.compile / CUDA Graphs ----
     use_compile: bool = True          # 네트워크/샘플러 torch.compile 사용

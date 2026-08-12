@@ -50,6 +50,14 @@ parser.add_argument("--all_tracks", action="store_true",
                     help="f1tenth 실서킷 + 절차 생성 맵도 함께 사용. 기본은 comp 폴더"
                          "(대회 코스+실측 연습맵)만 — 학습(기본 comp-only)과 트랙 분포 일치.")
 parser.add_argument("--log_every", type=int, default=100)
+parser.add_argument("--obs_noise", action="store_true",
+                    help="평가 중에도 관측 도메인 랜덤화(스캔/측위 노이즈)를 켠다. "
+                         "★실차 배포용 체크포인트를 고를 때는 반드시 이 옵션을 쓸 것 — "
+                         "노이즈를 끈 평가는 '깨끗한 관측에서만 잘하는' 취약한 정책을 "
+                         "가장 좋게 평가한다(실차 실패의 전형적 경로). 기본은 구 동작(끔).")
+parser.add_argument("--mu_range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                    help="평가 지면 마찰 범위 덮어쓰기. 학습과 다른 그립에서의 강건성을 "
+                         "보려면 지정 (예: 학습 0.85~1.25, 평가 --mu_range 0.5 0.7)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -96,7 +104,10 @@ def main():
     cfg.project_dir = project_dir
     cfg.track_field.num_envs = args.num_envs
     cfg.wall_visuals = not args.no_wall_visuals   # 시각화가 목적이므로 기본 켜짐
-    cfg.racing.obs_noise = False                  # 평가: 관측 도메인 랜덤화 끔 (env_cfg 주석 참조)
+    # 평가 관측 노이즈: 기본은 끔(시각화/디버깅용). 배포 체크포인트 선정에는 --obs_noise 로 켤 것.
+    cfg.racing.obs_noise = bool(args.obs_noise)
+    if args.mu_range is not None:                 # 학습과 다른 그립에서의 강건성 평가
+        cfg.tire.mu_range = (float(args.mu_range[0]), float(args.mu_range[1]))
     if not args.all_tracks:                       # 기본: comp 폴더만 (학습과 트랙 분포 일치)
         cfg.track_field.num_procedural = 0
         cfg.track_field.use_f1tenth = False

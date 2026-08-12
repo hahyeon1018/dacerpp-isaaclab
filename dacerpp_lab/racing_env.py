@@ -436,7 +436,10 @@ class RacingEnv(DirectRLEnv):
         forces[:, 0, 1] = fy_tot
         torques = torch.zeros(n, 1, 3, device=self.device)
         torques[:, 0, 2] = mz
-        car.set_external_force_and_torque(forces, torques, body_ids=base_id)
+        # set_external_force_and_torque 는 deprecated (IsaacLab 0.54+) — 내부적으로
+        # 그대로 아래 composer 를 호출하므로 동작은 동일하고 경고만 사라진다.
+        car.permanent_wrench_composer.set_forces_and_torques(
+            forces=forces, torques=torques, body_ids=base_id)
 
     def set_curriculum_progress(self, it: int):
         """속도 커리큘럼 램프: 명령 속도 상한을 v0 -> v_max 로 선형 증가.

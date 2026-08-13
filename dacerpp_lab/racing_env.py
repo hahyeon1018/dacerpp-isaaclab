@@ -2,7 +2,8 @@
 
 설계 요지
   - num_envs = 환경 수(기준 4096). 각 환경에 car_a, car_b 두 대 스폰.
-    트랙은 competition_tracks 512종을 env i -> track (i % 512) 로 균형 배정.
+    트랙은 competition_tracks 1024종을 env i -> track (i % 1024) 로 균형 배정
+    (V자 512 + U자/ㄷ자 512 — 2026-08-13 끝단 노치 형상 확장, make_competition_tracks.py 참조).
   - 물리는 평면. 트랙은 중심선+가변 폭 프로파일(1~5m, 실 대회장 덕트 간격)로
     해석적 정의(이탈=종료). 이탈판정/보상/관측 정규화는 지역 half-width 기준.
   - 스캔은 좌/우 벽 폴리라인(덕트) 레이캐스트 + 상대차량 footprint 오버레이.

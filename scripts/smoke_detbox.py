@@ -41,7 +41,12 @@ def main():
     env = RacingEnv(cfg); dev = env.device; rc = cfg.racing
     N = env.num_envs; B = rc.n_beams
     obs_dim = rc.obs_dim()
-    out(f"[obs_dim] {obs_dim} (감지박스는 스캔/가시성 내용만 바꿈, 차원 불변 기대 58)")
+    # 감지박스는 스캔/가시성 '내용'만 바꾸므로 차원은 obs_dim() 공식과 일치해야 한다.
+    # 상수(58)로 박아두면 curv_lookahead 를 늘릴 때마다 이 스모크가 헛돈다.
+    dim_expect = (rc.n_beams + 1 + 2 + 1 + len(rc.curv_lookahead)
+                  + (1 + len(rc.curv_lookahead)) + 2 * rc.act_hist_len
+                  + rc.n_opp_feats + 2)
+    out(f"[obs_dim] {obs_dim} (감지박스는 차원 불변 — 구성식 기대 {dim_expect})")
 
     # 시각 프림 확인
     stage = omni.usd.get_context().get_stage()
@@ -76,7 +81,7 @@ def main():
     out(f"[스캔] 관측 스캔 [{float(scan_a.min()):.2f},{float(scan_a.max()):.2f}] (0~1), "
         f"근접반사(<0.35) env {int((scan_a < 0.35).any(1).sum())}/{N}")
     out(f"[NaN] {'발생' if nan else '없음'}")
-    ok = (not nan) and (obs_dim == 58) and (npr == 2 * N) and (vis_any > 0)
+    ok = (not nan) and (obs_dim == dim_expect) and (npr == 2 * N) and (vis_any > 0)
     out(f"\n{'✅ 감지박스 스모크 통과' if ok else '❌ 확인 필요'}")
     env.close()
 

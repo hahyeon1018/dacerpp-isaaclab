@@ -62,6 +62,10 @@ parser.add_argument("--collapse_pstd", type=float, default=0.02,
 parser.add_argument("--mu_range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
                     help="지면 마찰 도메인 랜덤화 범위 덮어쓰기 (예: --mu_range 0.45 0.75). "
                          "여러 머신에서 마찰만 바꿔 스윕할 때 사용")
+parser.add_argument("--pose_noise", type=float, nargs=2, default=None,
+                    metavar=("LATERAL", "HEADING"),
+                    help="측위 관측 노이즈 스윕 [m, rad] (기본: env_cfg 0.10 0.05). "
+                         "실차 측위 실측 근거는 env_cfg.pose_noise_lateral 주석 참조")
 parser.add_argument("--curv_clip", type=float, default=None,
                     help="전방 곡률 관측 클립(±) 덮어쓰기. 미지정 시 env_cfg 기본값(3.0). "
                          "★배포 rl_controller.yaml 의 curv_clip 과 반드시 같은 값을 쓸 것")
@@ -163,6 +167,9 @@ def main():
         cfg.tire.mu_range = (float(args.mu_range[0]), float(args.mu_range[1]))
     if args.curv_clip is not None:
         cfg.racing.curv_clip = float(args.curv_clip)
+    if args.pose_noise is not None:
+        cfg.racing.pose_noise_lateral = float(args.pose_noise[0])
+        cfg.racing.pose_noise_heading = float(args.pose_noise[1])
     # gym 공간 정합 (dict 관측의 "policy" 키 = 두 차량 관측 concat)
     cfg.observation_space = 2 * cfg.racing.obs_dim()
     # 트랙이 서로 안 겹치도록 그리드 간격을 트랙 크기에 맞춤
@@ -243,6 +250,17 @@ def main():
             "scan_sector_rays": cfg.racing.scan_sector_rays,
             "scan_noise_std": cfg.racing.scan_noise_std,
             "scan_angle_jitter": cfg.racing.scan_angle_jitter,
+            # sim2real 관측 정렬 (2026-08-17) — 배포 yaml/실차 TF 와 세트로 확인할 것
+            "scan_blind_box": list(cfg.racing.scan_blind_box) if cfg.racing.scan_blind_box else None,
+            "obs_ref_offset_x": cfg.racing.obs_ref_offset_x,
+            "vy_obs_ma_steps": cfg.racing.vy_obs_ma_steps,
+            "vy_noise_std": cfg.racing.vy_noise_std,
+            # 관측 구성/스윕 축 (배포 yaml 과 반드시 일치해야 하는 값 포함)
+            "curv_lookahead": list(cfg.racing.curv_lookahead),
+            "obs_dim": obs_dim,
+            "pose_noise_lateral": cfg.racing.pose_noise_lateral,
+            "pose_noise_heading": cfg.racing.pose_noise_heading,
+            "gamma": agent_pow.cfg.gamma,
             "act_delay": [cfg.racing.act_delay_min, cfg.racing.act_delay_max],
             "act_hist_len": cfg.racing.act_hist_len,
             "v_max": cfg.racing.v_max, "v_min": cfg.racing.v_min,

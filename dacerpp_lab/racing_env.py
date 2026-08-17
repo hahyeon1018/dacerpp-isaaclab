@@ -94,6 +94,11 @@ class RacingEnv(DirectRLEnv):
         self._hist_a = torch.zeros(N, 2 * rc.act_hist_len, device=dev)
         self._hist_b = torch.zeros(N, 2 * rc.act_hist_len, device=dev)
         self._prev_v_a, self._prev_v_b = z(), z()          # 직전 스텝 속력(가속 벌점용)
+        # 횡속도 관측 이동평균 버퍼 (env_cfg.vy_obs_ma_steps — 실차 carstate_3d 의 MA(10) 모사)
+        self._vy_ma = max(1, int(rc.vy_obs_ma_steps))
+        self._vy_buf_a = torch.zeros(N, self._vy_ma, device=dev)
+        self._vy_buf_b = torch.zeros(N, self._vy_ma, device=dev)
+        self._vy_obs_a, self._vy_obs_b = z(), z()          # 스텝당 1회 갱신된 관측용 vy
         # 추월 이벤트 감지용: 직전 스텝의 s 간격(A-B, 랩 래핑) + 재지급 쿨다운
         self._prev_gap_ab = z()
         self._ot_cd_a = torch.zeros(N, dtype=torch.long, device=dev)
@@ -492,6 +497,19 @@ class RacingEnv(DirectRLEnv):
         vy = -vel[:, 0] * siny + vel[:, 1] * cosy
         return vx, vy, car.data.root_ang_vel_w[:, 2]
 
+    def _push_vy(self, buf: torch.Tensor, vy: torch.Tensor) -> torch.Tensor:
+        """횡속도 이동평균 버퍼에 최신값을 넣고 평균을 반환 (in-place, 최신이 앞).
+
+        실차 carstate_3d_node 는 포즈 차분 vy 를 10샘플(=100ms @EKF 100Hz) 이동평균
+        해서 /car_state/odom 에 싣는다. 30Hz 제어에서 같은 시간창은 3스텝이다.
+        평균이므로 지연뿐 아니라 고주파 성분 감쇠까지 함께 재현된다.
+        """
+        if self._vy_ma <= 1:
+            return vy
+        buf[:, 1:] = buf[:, :-1].clone()
+        buf[:, 0] = vy
+        return buf.mean(dim=1)
+
     def _wrap_ds(self, ds):
         tot = self._total_s
         ds = torch.where(ds < -0.5 * tot, ds + tot, ds)
@@ -562,6 +580,12 @@ class RacingEnv(DirectRLEnv):
         vx_b, vy_b, r_b = self._body_dyn(self.car_b, yb)
         beta_a = torch.atan2(vy_a.abs(), vx_a.abs().clamp(min=0.5))
         beta_b = torch.atan2(vy_b.abs(), vx_b.abs().clamp(min=0.5))
+        # 횡속도 '관측'만 실차 추정기의 이동평균 지연을 통과시킨다 (env_cfg.vy_obs_ma_steps).
+        # β 벌점/종료는 참값(vy_a/vy_b)을 계속 쓴다 — 보상은 물리를 봐야 하고,
+        # 지연은 정책이 감당해야 할 관측 결함이기 때문. 스텝당 한 번만 갱신하고
+        # (_get_dones 는 스텝당 1회) _get_observations 는 그 결과를 읽기만 한다.
+        self._vy_obs_a = self._push_vy(self._vy_buf_a, vy_a)
+        self._vy_obs_b = self._push_vy(self._vy_buf_b, vy_b)
 
         # 실측 종가속도 (행동이 아니라 물리 속도 변화 기준; 급감속->급가속 반복 억제)
         dv_a = (va - self._prev_v_a) / self.step_dt
@@ -643,8 +667,8 @@ class RacingEnv(DirectRLEnv):
 
         # 부트스트랩용 최종 관측(리셋 전 상태). 히스토리는 방금 롤했으므로
         # 최신 항목이 a_t(이번 스텝 명령) -> s_{t+1} 관측과 시점이 일치한다.
-        self._final_obs_a = self._observe_car(la, ya, va, vy_a, r_a, pa, lb, yb, vb, pb, self._hist_a)
-        self._final_obs_b = self._observe_car(lb, yb, vb, vy_b, r_b, pb, la, ya, va, pa, self._hist_b)
+        self._final_obs_a = self._observe_car(la, ya, va, self._vy_obs_a, r_a, pa, lb, yb, vb, pb, self._hist_a)
+        self._final_obs_b = self._observe_car(lb, yb, vb, self._vy_obs_b, r_b, pb, la, ya, va, pa, self._hist_b)
 
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         # 차량별 리셋: term 난 차만 개별 리스폰하고 상대는 계속 주행한다.
@@ -664,16 +688,26 @@ class RacingEnv(DirectRLEnv):
     def _observe_car(self, local_xy, yaw, speed, vy, yawrate, proj, opp_local_xy, opp_yaw,
                      opp_speed, opp_proj, act_hist):
         rc = self.cfg.racing
+        # ---- 관측 기준점을 실차 base_link(뒤축)로 이동 (env_cfg.obs_ref_offset_x) ----
+        # 인자로 받은 local_xy/proj 는 물리 루트(=URDF base_link=축거 중점) 기준이고
+        # 보상/종료가 그것을 쓴다. 관측만 뒤축으로 옮겨 실차와 같은 점에서 만든다.
+        # 재투영 비용은 레이캐스트의 ~2% 수준이라 무시 가능하다.
+        ref_xy = local_xy
+        if rc.obs_ref_offset_x != 0.0:
+            fwd = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=1)      # (N,2) 차체 전방
+            ref_xy = local_xy + rc.obs_ref_offset_x * fwd
+            proj = self._vt.project(ref_xy, self._track_type)
         s, lateral, idx = proj["s"], proj["lateral"], proj["idx"]
         herr = wrap_to_pi(yaw - proj["psi"])
         curv = self._vt.lookahead_curvature(idx, self._track_type, self._curv_offsets)
         width = self._vt.lookahead_width(idx, self._track_type, self._width_offsets)  # (N,1+k)
         hw_local = width[:, 0]
 
-        wall_scan, scan = self._scan(local_xy, yaw, idx, opp_local_xy, opp_yaw)
+        wall_scan, scan = self._scan(ref_xy, yaw, idx, opp_local_xy, opp_yaw)
 
-        # 차체 기준 상대차량 위치
-        rel = opp_local_xy - local_xy
+        # 차체 기준 상대차량 위치 (기준점 = 관측 기준점 = 뒤축, 실차 rl_controller 와 동일:
+        # 실차는 자차 pose(base_link)에서 상대차 '차중심'까지의 상대좌표를 만든다)
+        rel = opp_local_xy - ref_xy
         cosy, siny = torch.cos(-yaw), torch.sin(-yaw)
         rel_x = rel[:, 0] * cosy - rel[:, 1] * siny
         rel_y = rel[:, 0] * siny + rel[:, 1] * cosy
@@ -804,6 +838,8 @@ class RacingEnv(DirectRLEnv):
         reduce_sector = (lambda r: r.reshape(r.shape[0], rc.n_beams, S).amin(dim=2)) \
             if S > 1 else (lambda r: r)
         # 벽 전용 스캔(상대차 가시성=벽 가림 판정용). 섹터 축약 후 빔 해상도로 돌린다.
+        # ★사각지대는 여기 적용하지 않는다 — 이건 '벽이 물리적으로 가리는가'를 보는
+        #   기하 판정이고, 사각지대는 자차 반사 제거라는 처리 단계의 산물이기 때문.
         scan = reduce_sector(rays)
         # 장애물 footprint 는 '축약 전' 레이 해상도에서 합성한다 — 실차에서도 장애물은
         # 섹터 안 점군으로 잡혀 그 섹터의 최소거리를 끌어내리기 때문(빔 각에만 얹으면
@@ -812,9 +848,18 @@ class RacingEnv(DirectRLEnv):
         if rc.obstacles_enabled and bool(self._obs_active.any()):
             rays = overlay_obstacles(rays, local_xy, ang_w, self._obs_verts,
                                      self._obs_active, rc.scan_max_range)
-            scan_wo = reduce_sector(rays)
-        else:
-            scan_wo = scan
+        # ---- 실차 자차반사 제거 박스로 생기는 근거리 사각지대 모사 ----
+        # (env_cfg.scan_blind_box 주석) 축약 '전' 레이 해상도에서 적용해야 실차와
+        # 같다 — 실차도 점 단위로 지운 뒤 섹터 min 을 취하므로, 섹터 안에 박스 밖
+        # 점이 하나라도 남아 있으면 그 거리가 살아난다. 빔 해상도에서 지우면
+        # 그런 섹터까지 통째로 날아가 과도하게 가려진다.
+        if rc.scan_blind_box is not None:
+            bx0, bx1, bay = (float(v) for v in rc.scan_blind_box)
+            hit_x = rays * torch.cos(ang_b)                 # (N,B*S) 차체 기준 히트 좌표
+            hit_y = rays * torch.sin(ang_b)
+            blind = (hit_x > bx0) & (hit_x < bx1) & (hit_y.abs() < bay)
+            rays = torch.where(blind, torch.full_like(rays, rc.scan_max_range), rays)
+        scan_wo = reduce_sector(rays)
         # ---- 상대차 감지 박스 오버레이 (구 원형 opp_radius 대체) ----
         # 실차는 상대차 뒷부분 감지 박스(12×12cm, 10~30cm 높이)만 LiDAR 로 검출한다.
         # 박스 중심(차중심에서 뒤로 det_box_rear)을 등가 원판으로 스캔에 반영하되,
@@ -839,10 +884,12 @@ class RacingEnv(DirectRLEnv):
         lb, yb, vb = self._car_state(self.car_b)
         pa = self._vt.project(la, self._track_type)
         pb = self._vt.project(lb, self._track_type)
-        _, vy_a, r_a = self._body_dyn(self.car_a, ya)
-        _, vy_b, r_b = self._body_dyn(self.car_b, yb)
-        obs_a = self._observe_car(la, ya, va, vy_a, r_a, pa, lb, yb, vb, pb, self._hist_a)
-        obs_b = self._observe_car(lb, yb, vb, vy_b, r_b, pb, la, ya, va, pa, self._hist_b)
+        _, _, r_a = self._body_dyn(self.car_a, ya)
+        _, _, r_b = self._body_dyn(self.car_b, yb)
+        # 횡속도는 _get_dones 가 이번 스텝에 갱신해 둔 이동평균값을 그대로 쓴다
+        # (여기서 다시 push 하면 스텝당 두 번 밀려 창 길이가 반토막 난다).
+        obs_a = self._observe_car(la, ya, va, self._vy_obs_a, r_a, pa, lb, yb, vb, pb, self._hist_a)
+        obs_b = self._observe_car(lb, yb, vb, self._vy_obs_b, r_b, pb, la, ya, va, pa, self._hist_b)
         return {"car_a": obs_a, "car_b": obs_b, "policy": torch.cat([obs_a, obs_b], dim=1)}
 
     # ------------------------------------------------------------------ #
@@ -1071,6 +1118,10 @@ class RacingEnv(DirectRLEnv):
         self._reset_delay_b(env_ids)
         self._prev_v_a[env_ids] = 0.0
         self._prev_v_b[env_ids] = 0.0
+        # 스폰은 정지 상태(_place 가 속도 0)이므로 vy 이동평균 창도 비운다.
+        # 안 비우면 직전 에피소드의 횡속도가 최대 3스텝 새어 들어온다.
+        self._vy_buf_a[env_ids] = 0.0
+        self._vy_buf_b[env_ids] = 0.0
         self._prev_s_a[env_ids] = sa
         self._prev_s_b[env_ids] = sb
         self._set_prev_gap(env_ids)
@@ -1105,6 +1156,7 @@ class RacingEnv(DirectRLEnv):
             self._prev_act_a[ids] = 0.0
             self._reset_delay_a(ids)
             self._prev_v_a[ids] = 0.0
+            self._vy_buf_a[ids] = 0.0        # vy 이동평균 창 비움(스폰=정지)
             self._prev_s_a[ids] = sa
             self._set_prev_gap(ids)
             self._resample_v_cap_a(ids)
@@ -1116,6 +1168,7 @@ class RacingEnv(DirectRLEnv):
             self._prev_act_b[ids] = 0.0
             self._reset_delay_b(ids)
             self._prev_v_b[ids] = 0.0
+            self._vy_buf_b[ids] = 0.0        # vy 이동평균 창 비움(스폰=정지)
             self._prev_s_b[ids] = sb
             self._set_prev_gap(ids)
             self._since_spawn_b[ids] = 0     # 장애물 grace(개별 리스폰 — 장애물은 유지)

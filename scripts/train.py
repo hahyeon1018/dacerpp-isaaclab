@@ -64,8 +64,10 @@ parser.add_argument("--mu_range", type=float, nargs=2, default=None, metavar=("L
                          "여러 머신에서 마찰만 바꿔 스윕할 때 사용")
 parser.add_argument("--pose_noise", type=float, nargs=2, default=None,
                     metavar=("LATERAL", "HEADING"),
-                    help="측위 관측 노이즈 스윕 [m, rad] (기본: env_cfg 0.10 0.05). "
-                         "실차 측위 실측 근거는 env_cfg.pose_noise_lateral 주석 참조")
+                    help="측위 관측 노이즈 스윕 [m, rad] (기본: env_cfg 0.05 0.02 — "
+                         "2026-08-18 실차 실측 기반). 상관시간/점프는 이 인자로 안 바뀌므로 "
+                         "env_cfg.pose_noise_corr_time / pose_jump_* 를 직접 수정할 것. "
+                         "실측 근거는 env_cfg.pose_noise_lateral 주석 참조")
 parser.add_argument("--curv_clip", type=float, default=None,
                     help="전방 곡률 관측 클립(±) 덮어쓰기. 미지정 시 env_cfg 기본값(3.0). "
                          "★배포 rl_controller.yaml 의 curv_clip 과 반드시 같은 값을 쓸 것")
@@ -255,6 +257,13 @@ def main():
             "obs_ref_offset_x": cfg.racing.obs_ref_offset_x,
             "vy_obs_ma_steps": cfg.racing.vy_obs_ma_steps,
             "vy_noise_std": cfg.racing.vy_noise_std,
+            # 측위 오차 모델 (2026-08-18 실차 실측 반영). 체크포인트를 실차에 실을 때
+            # 어떤 오차 가정으로 학습됐는지 알아야 해석이 되므로 함께 남긴다.
+            "vy_dropout_p": cfg.racing.vy_dropout_p,
+            "pose_noise_corr_time": cfg.racing.pose_noise_corr_time,
+            "pose_jump_p": cfg.racing.pose_jump_p,
+            "pose_jump_std": cfg.racing.pose_jump_std,
+            "gyro_noise_std": cfg.racing.gyro_noise_std,
             # 관측 구성/스윕 축 (배포 yaml 과 반드시 일치해야 하는 값 포함)
             "curv_lookahead": list(cfg.racing.curv_lookahead),
             "obs_dim": obs_dim,

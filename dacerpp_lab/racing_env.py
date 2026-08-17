@@ -31,6 +31,7 @@ DirectRLEnv.step() 호출 순서를 정확히 따른다:
 """
 from __future__ import annotations
 
+import math
 from typing import Tuple
 
 import numpy as np
@@ -99,6 +100,11 @@ class RacingEnv(DirectRLEnv):
         self._vy_buf_a = torch.zeros(N, self._vy_ma, device=dev)
         self._vy_buf_b = torch.zeros(N, self._vy_ma, device=dev)
         self._vy_obs_a, self._vy_obs_b = z(), z()          # 스텝당 1회 갱신된 관측용 vy
+        # 측위 오차의 상관 성분 (env_cfg.pose_noise_corr_time — 실측 자기상관 lag1 0.90~0.94).
+        # 백색잡음과 달리 스텝 간에 유지돼야 하므로 상태로 들고 간다. vy 이동평균과 같은
+        # 이유로 스텝당 1회만 전진시키고 _observe_car 는 읽기만 한다.
+        self._pn_lat_a, self._pn_lat_b = z(), z()          # 횡 오차 [m]
+        self._pn_head_a, self._pn_head_b = z(), z()        # heading 오차 [rad]
         # 추월 이벤트 감지용: 직전 스텝의 s 간격(A-B, 랩 래핑) + 재지급 쿨다운
         self._prev_gap_ab = z()
         self._ot_cd_a = torch.zeros(N, dtype=torch.long, device=dev)
@@ -403,7 +409,11 @@ class RacingEnv(DirectRLEnv):
 
         # 종방향 요구력 (속도서보 + 모터 상한)
         v_cmd = rc.v_min + (act[:, 1] + 1.0) * 0.5 * (v_cmd_max - rc.v_min)
-        fx_des = (tc.k_drive * (v_cmd - vx)).clamp(-tc.f_drive_max, tc.f_drive_max)
+        # 구동/제동 상한을 분리한다 (env_cfg.f_brake_max, 2026-08-18 실측):
+        # 실차 제동(≈3.0 m/s^2)은 구동(≈6.1 m/s^2)의 절반이다. 대칭 clamp 를 쓰면
+        # 시뮬이 실차의 2배로 서게 되어 '늦게 밟아도 되는' 정책을 학습한다.
+        f_brake = float(getattr(tc, "f_brake_max", tc.f_drive_max))
+        fx_des = (tc.k_drive * (v_cmd - vx)).clamp(-f_brake, tc.f_drive_max)
 
         # 종하중이동 (요구 가속 기반 준정적 근사)
         ax_est = fx_des / tc.mass
@@ -510,6 +520,45 @@ class RacingEnv(DirectRLEnv):
         buf[:, 0] = vy
         return buf.mean(dim=1)
 
+    def _advance_pose_noise(self) -> None:
+        """측위 관측 오차를 한 스텝 전진 (AR(1) 상관 성분 + 단발 점프).
+
+        실차 실측(2026-08-18, loc_debug_0817_2323/2326)에서 ndt-ekf 잔차의 자기상관이
+        횡 lag1 +0.90~0.94, lag7(700ms) +0.46~0.65 였다. 즉 측위 오차는 백색잡음이
+        아니라 상관시간 ~1s 의 느린 오프셋이다. 백색으로만 학습하면 정책은 몇 스텝
+        평균으로 지울 수 있다고 배우는데, 실차에서는 코너 하나를 통과하는 동안
+        거의 고정된 오프셋이라 지워지지 않는다 (env_cfg.pose_noise_corr_time 주석).
+
+        AR(1): x <- rho*x + sqrt(1-rho^2)*eps  (정상분포 std 를 sigma 로 유지)
+        rho = exp(-dt/T). T=0 이면 rho=0 = 백색잡음(구 동작)과 동일하다.
+        """
+        rc = self.cfg.racing
+        if not rc.obs_noise:
+            return
+        T = float(getattr(rc, "pose_noise_corr_time", 0.0))
+        rho = math.exp(-self.step_dt / T) if T > 0.0 else 0.0
+        keep = math.sqrt(max(0.0, 1.0 - rho * rho))
+        jp = float(getattr(rc, "pose_jump_p", 0.0))
+        js = float(getattr(rc, "pose_jump_std", 0.0))
+
+        def step(state, sigma):
+            if sigma <= 0.0:
+                return torch.zeros_like(state)
+            nxt = rho * state + keep * torch.randn_like(state) * sigma
+            if jp > 0.0 and js > 0.0:
+                # 단발 점프: 상관 성분으로는 안 나오는 EKF 보정 스텝의 튐
+                # (실측 30Hz 이동보정 잔차 p95 57mm / max 199mm @4~6m/s).
+                # 상태에 누적시키지 않고 그 스텝에만 얹는다 — 실차에서도 다음 프레임에
+                # 회복되는 단발성이었다.
+                hit = (torch.rand_like(state) < jp).float()
+                return nxt + hit * torch.randn_like(state) * js
+            return nxt
+
+        self._pn_lat_a = step(self._pn_lat_a, rc.pose_noise_lateral)
+        self._pn_lat_b = step(self._pn_lat_b, rc.pose_noise_lateral)
+        self._pn_head_a = step(self._pn_head_a, rc.pose_noise_heading)
+        self._pn_head_b = step(self._pn_head_b, rc.pose_noise_heading)
+
     def _wrap_ds(self, ds):
         tot = self._total_s
         ds = torch.where(ds < -0.5 * tot, ds + tot, ds)
@@ -586,6 +635,8 @@ class RacingEnv(DirectRLEnv):
         # (_get_dones 는 스텝당 1회) _get_observations 는 그 결과를 읽기만 한다.
         self._vy_obs_a = self._push_vy(self._vy_buf_a, vy_a)
         self._vy_obs_b = self._push_vy(self._vy_buf_b, vy_b)
+        # 측위 오차도 스텝당 1회 전진 (관측은 이 값을 읽기만 한다 — vy 와 같은 이유)
+        self._advance_pose_noise()
 
         # 실측 종가속도 (행동이 아니라 물리 속도 변화 기준; 급감속->급가속 반복 억제)
         dv_a = (va - self._prev_v_a) / self.step_dt
@@ -667,8 +718,10 @@ class RacingEnv(DirectRLEnv):
 
         # 부트스트랩용 최종 관측(리셋 전 상태). 히스토리는 방금 롤했으므로
         # 최신 항목이 a_t(이번 스텝 명령) -> s_{t+1} 관측과 시점이 일치한다.
-        self._final_obs_a = self._observe_car(la, ya, va, self._vy_obs_a, r_a, pa, lb, yb, vb, pb, self._hist_a)
-        self._final_obs_b = self._observe_car(lb, yb, vb, self._vy_obs_b, r_b, pb, la, ya, va, pa, self._hist_b)
+        self._final_obs_a = self._observe_car(la, ya, va, self._vy_obs_a, r_a, pa, lb, yb, vb, pb,
+                                              self._hist_a, self._pn_lat_a, self._pn_head_a)
+        self._final_obs_b = self._observe_car(lb, yb, vb, self._vy_obs_b, r_b, pb, la, ya, va, pa,
+                                              self._hist_b, self._pn_lat_b, self._pn_head_b)
 
         truncated = self.episode_length_buf >= self.max_episode_length - 1
         # 차량별 리셋: term 난 차만 개별 리스폰하고 상대는 계속 주행한다.
@@ -686,7 +739,7 @@ class RacingEnv(DirectRLEnv):
     # 관측 (리셋 후 상태에서 새로 계산)
     # ------------------------------------------------------------------ #
     def _observe_car(self, local_xy, yaw, speed, vy, yawrate, proj, opp_local_xy, opp_yaw,
-                     opp_speed, opp_proj, act_hist):
+                     opp_speed, opp_proj, act_hist, pn_lat=None, pn_head=None):
         rc = self.cfg.racing
         # ---- 관측 기준점을 실차 base_link(뒤축)로 이동 (env_cfg.obs_ref_offset_x) ----
         # 인자로 받은 local_xy/proj 는 물리 루트(=URDF base_link=축거 중점) 기준이고
@@ -742,9 +795,22 @@ class RacingEnv(DirectRLEnv):
                 drop = torch.rand_like(scan) < rc.scan_dropout_p
                 scan = torch.where(drop, torch.full_like(scan, rc.scan_max_range), scan)
             scan = scan.clamp(0.0, rc.scan_max_range)
-            lat_o = lateral + torch.randn_like(lateral) * rc.pose_noise_lateral
-            herr_o = herr + torch.randn_like(herr) * rc.pose_noise_heading
+            # 측위 오차: _advance_pose_noise 가 스텝당 1회 갱신한 상관 성분을 그대로 쓴다.
+            # (상태를 못 받은 호출 경로는 구 동작인 백색잡음으로 폴백)
+            if pn_lat is None:
+                lat_o = lateral + torch.randn_like(lateral) * rc.pose_noise_lateral
+            else:
+                lat_o = lateral + pn_lat
+            if pn_head is None:
+                herr_o = herr + torch.randn_like(herr) * rc.pose_noise_heading
+            else:
+                herr_o = herr + pn_head
             vy_o = vy + torch.randn_like(vy) * rc.vy_noise_std
+            # 실차 /car_state/odom 의 vy 가 62% 확률로 0 이 되는 결함을 모사
+            # (env_cfg.vy_dropout_p 주석). 0 = 끔.
+            if getattr(rc, "vy_dropout_p", 0.0) > 0.0:
+                alive = (torch.rand_like(vy_o) >= rc.vy_dropout_p).float()
+                vy_o = vy_o * alive
             r_o = yawrate + torch.randn_like(yawrate) * rc.gyro_noise_std
             if rc.opp_pos_noise > 0:
                 rel_x = rel_x + torch.randn_like(rel_x) * rc.opp_pos_noise
@@ -888,8 +954,10 @@ class RacingEnv(DirectRLEnv):
         _, _, r_b = self._body_dyn(self.car_b, yb)
         # 횡속도는 _get_dones 가 이번 스텝에 갱신해 둔 이동평균값을 그대로 쓴다
         # (여기서 다시 push 하면 스텝당 두 번 밀려 창 길이가 반토막 난다).
-        obs_a = self._observe_car(la, ya, va, self._vy_obs_a, r_a, pa, lb, yb, vb, pb, self._hist_a)
-        obs_b = self._observe_car(lb, yb, vb, self._vy_obs_b, r_b, pb, la, ya, va, pa, self._hist_b)
+        obs_a = self._observe_car(la, ya, va, self._vy_obs_a, r_a, pa, lb, yb, vb, pb,
+                                  self._hist_a, self._pn_lat_a, self._pn_head_a)
+        obs_b = self._observe_car(lb, yb, vb, self._vy_obs_b, r_b, pb, la, ya, va, pa,
+                                  self._hist_b, self._pn_lat_b, self._pn_head_b)
         return {"car_a": obs_a, "car_b": obs_b, "policy": torch.cat([obs_a, obs_b], dim=1)}
 
     # ------------------------------------------------------------------ #
@@ -1122,6 +1190,13 @@ class RacingEnv(DirectRLEnv):
         # 안 비우면 직전 에피소드의 횡속도가 최대 3스텝 새어 들어온다.
         self._vy_buf_a[env_ids] = 0.0
         self._vy_buf_b[env_ids] = 0.0
+        # 측위 오차의 상관 성분도 에피소드마다 새로 뽑는다. 안 비우면 상관시간(~1s =
+        # 30스텝)만큼 직전 에피소드의 오프셋이 새어 들어와, 스폰 직후 관측이 이전
+        # 트랙의 오차를 물고 시작한다. 0 에서 시작해 상관시간에 걸쳐 정상분포로 붙는다.
+        self._pn_lat_a[env_ids] = 0.0
+        self._pn_lat_b[env_ids] = 0.0
+        self._pn_head_a[env_ids] = 0.0
+        self._pn_head_b[env_ids] = 0.0
         self._prev_s_a[env_ids] = sa
         self._prev_s_b[env_ids] = sb
         self._set_prev_gap(env_ids)

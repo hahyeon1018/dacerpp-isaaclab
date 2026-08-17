@@ -25,7 +25,6 @@ dist/
 # ROS2 bag / 기록 데이터
 *.db3
 *.mcap
-generated/
 rosbag*/
 
 # 학습 산출물

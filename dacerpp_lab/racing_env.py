@@ -385,9 +385,11 @@ class RacingEnv(DirectRLEnv):
                            v_cmd_max):
         """동적 자전거 모델 타이어 힘 -> 섀시 외력 (바디 로컬 프레임 인가).
 
-        - 슬립각 -> 축별 횡력: F_y = -mu*N*tanh(alpha/alpha_char) (포화 슬립 곡선)
-        - 종방향: ESC 속도서보 F_x = k*(v_cmd - vx), 모터 상한 + 뒤축(RWD)
-          마찰서클 제한. 종하중이동(가감속 시 앞/뒤 하중 재분배) 반영.
+        - 슬립각 -> 축별 횡력: F_y = -mu*N*tanh(alpha/alpha_char_{f,r}) (포화 슬립 곡선).
+          앞/뒤 특성 슬립각을 분리해야 언더스티어가 생긴다 (2026-08-21 실측 반영).
+        - 종방향: ESC 속도서보 F_x = k*(v_cmd - vx), 모터 상한 + **4WD 축별
+          마찰서클** 제한(구동력을 축하중 비례 분배 -> 종방향 합 캡 = mu*m*g).
+          종하중이동(가감속 시 앞/뒤 하중 재분배) 반영.
         - 조향각은 명령이 아니라 '실제 조향 조인트 각'(액추에이터 지연 포함).
         (근거/파라미터 식별 방법: env_cfg.TireModelCfg docstring)
         """
@@ -426,14 +428,30 @@ class RacingEnv(DirectRLEnv):
         taper = torch.tanh(vx.abs() / max(tc.v_lat_taper, 1e-3))
         alpha_f = torch.atan2(vy + tc.lf * r, vx_eff) - delta
         alpha_r = torch.atan2(vy - tc.lr * r, vx_eff)
-        fyf = -self._mu * nf * torch.tanh(alpha_f / tc.alpha_char) * taper
-        fyr = -self._mu * nr * torch.tanh(alpha_r / tc.alpha_char) * taper
+        # 앞/뒤 특성 슬립각 분리 (★2026-08-21, env_cfg.alpha_char_f/r 주석 참조).
+        # 같은 값을 쓰면 정상상태에서 alpha_f = alpha_r 이 되어 언더스티어가 정확히
+        # 0 인 차가 된다 — 실차는 강한 언더스티어이고, 그게 이번 실패 증상이었다.
+        fyf = -self._mu * nf * torch.tanh(alpha_f / tc.alpha_char_f) * taper
+        fyr = -self._mu * nr * torch.tanh(alpha_r / tc.alpha_char_r) * taper
 
-        # 뒤축 마찰서클 (RWD: 구동/제동이 뒤축 횡그립을 잠식)
+        # ---- 4WD 마찰서클 (★2026-08-21, 섀시 4WD 확인) ----
+        # 구 코드는 뒤축에만 마찰서클을 걸었다(RWD 가정). 그러면 종방향 캡이
+        # mu*N_r 뿐이라 정지가속이 mu*g*lf/(L-mu*h) = 2.95 m/s^2 로, 실측
+        # 5.6~6.3 m/s^2 의 절반이다. 4WD 는 네 바퀴가 모두 구동하므로 종방향 캡이
+        # mu*(N_f+N_r) = mu*m*g 가 된다 (실측과 일치).
+        # 구동력을 축하중 비례로 나눠 축별 마찰서클을 각각 적용한다 —
+        # 종방향 합은 mu*m*g 가 되고, 횡력 잠식은 축별로 유지된다(물리적으로 옳다).
+        # 부수 효과: 가속/제동 중 앞축 횡여유가 줄어 언더스티어가 더 생긴다(실차 거동).
+        n_tot = (nf + nr).clamp(min=1e-6)
+        fx_f_des = fx_des * nf / n_tot
+        fx_r_des = fx_des * nr / n_tot
+        cap_f = self._mu * nf
         cap_r = self._mu * nr
-        norm_r = torch.sqrt(fx_des ** 2 + fyr ** 2).clamp(min=1e-6)
-        scale_r = (cap_r / norm_r).clamp(max=1.0)
-        fx_r = fx_des * scale_r
+        scale_f = (cap_f / torch.sqrt(fx_f_des ** 2 + fyf ** 2).clamp(min=1e-6)).clamp(max=1.0)
+        scale_r = (cap_r / torch.sqrt(fx_r_des ** 2 + fyr ** 2).clamp(min=1e-6)).clamp(max=1.0)
+        fx_f = fx_f_des * scale_f
+        fyf = fyf * scale_f
+        fx_r = fx_r_des * scale_r
         fyr = fyr * scale_r
 
         # 구름저항 + 합력/요모멘트 (앞축 힘은 조향각만큼 차체로 회전)
@@ -442,9 +460,12 @@ class RacingEnv(DirectRLEnv):
         # 전복 게이트: 뒤집힌 차(중력 z_b > -0.5)에는 타이어 힘 인가 중단
         # (바퀴가 지면에 없으므로 물리적으로도 0; 전복 후 폭주/텔레포트 방지)
         up = (car.data.projected_gravity_b[:, 2] < -0.5).float()
-        fx_tot = (fx_r + f_roll - fyf * sind) * up
-        fy_tot = (fyr + fyf * cosd) * up
-        mz = (tc.lf * fyf * cosd - tc.lr * fyr) * up
+        # 앞축 힘(종/횡)을 조향각만큼 차체 프레임으로 회전. 4WD 라 종방향 성분
+        # fx_f 가 새로 생겼으므로 요모멘트에도 그 기여(lf * fx_f*sind)가 들어간다.
+        fy_front_b = fx_f * sind + fyf * cosd
+        fx_tot = (fx_f * cosd - fyf * sind + fx_r + f_roll) * up
+        fy_tot = (fy_front_b + fyr) * up
+        mz = (tc.lf * fy_front_b - tc.lr * fyr) * up
 
         n = fx_tot.shape[0]
         forces = torch.zeros(n, 1, 3, device=self.device)
@@ -478,7 +499,8 @@ class RacingEnv(DirectRLEnv):
 
     def _drive_one(self, car: Articulation, act: torch.Tensor, steer_ids, drive_ids, v_cmd_max):
         rc = self.cfg.racing
-        steer = act[:, 0] * rc.max_steering_angle                       # (N,)
+        # 조향 링키지 게인(env_cfg.steer_gain): 실차는 명령보다 12% 크게 꺾인다.
+        steer = act[:, 0] * rc.max_steering_angle * rc.steer_gain       # (N,)
         speed = rc.v_min + (act[:, 1] + 1.0) * 0.5 * (v_cmd_max - rc.v_min)
         wheel_w = speed / max(rc.wheel_radius, 1e-3)                     # rad/s
         steer_t = steer.unsqueeze(1).expand(-1, len(steer_ids))

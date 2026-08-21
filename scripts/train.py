@@ -68,6 +68,11 @@ parser.add_argument("--pose_noise", type=float, nargs=2, default=None,
                          "2026-08-18 실차 실측 기반). 상관시간/점프는 이 인자로 안 바뀌므로 "
                          "env_cfg.pose_noise_corr_time / pose_jump_* 를 직접 수정할 것. "
                          "실측 근거는 env_cfg.pose_noise_lateral 주석 참조")
+parser.add_argument("--accel_ref", type=float, default=None,
+                    help="종가속도 벌점 정규화 기준 [m/s^2] (기본: env_cfg 7.0). "
+                         "도달 가능 최대 가속 = mu*g 이므로 --mu_range 를 바꾸면 이 값도 "
+                         "같이 바꿔야 머신 간 벌점 균형이 유지된다 "
+                         "(예: mu 0.675 -> 6.6, 0.815 -> 8.0, 0.975 -> 9.2)")
 parser.add_argument("--curv_clip", type=float, default=None,
                     help="전방 곡률 관측 클립(±) 덮어쓰기. 미지정 시 env_cfg 기본값(3.0). "
                          "★배포 rl_controller.yaml 의 curv_clip 과 반드시 같은 값을 쓸 것")
@@ -169,6 +174,8 @@ def main():
         cfg.tire.mu_range = (float(args.mu_range[0]), float(args.mu_range[1]))
     if args.curv_clip is not None:
         cfg.racing.curv_clip = float(args.curv_clip)
+    if args.accel_ref is not None:
+        cfg.racing.accel_ref = float(args.accel_ref)
     if args.pose_noise is not None:
         cfg.racing.pose_noise_lateral = float(args.pose_noise[0])
         cfg.racing.pose_noise_heading = float(args.pose_noise[1])
@@ -266,6 +273,7 @@ def main():
             "gyro_noise_std": cfg.racing.gyro_noise_std,
             # 관측 구성/스윕 축 (배포 yaml 과 반드시 일치해야 하는 값 포함)
             "curv_lookahead": list(cfg.racing.curv_lookahead),
+            "accel_ref": cfg.racing.accel_ref,
             "obs_dim": obs_dim,
             "pose_noise_lateral": cfg.racing.pose_noise_lateral,
             "pose_noise_heading": cfg.racing.pose_noise_heading,
